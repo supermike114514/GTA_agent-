@@ -148,6 +148,21 @@ if ($Junction) {
     Say ("      已复制 GTA5Buddy.dll  {0:N0} 字节" -f (Get-Item (Join-Path $scriptsDir 'GTA5Buddy.dll')).Length) 'Green'
 }
 
+# --- LemonUI: hard dependency of the graphical panel ------------------------
+# The menu is drawn through LemonUI (which renders via the game's own Scaleform UI
+# system). Without this DLL next to the mod, SHVDN fails to load GTA5Buddy entirely,
+# so a missing copy here shows up as "the mod does nothing at all".
+$lemonSrc = Join-Path $Root '_runtime\LemonUI.SHVDN3.dll'
+$lemonDst = Join-Path $scriptsDir 'LemonUI.SHVDN3.dll'
+if (Test-Path $lemonSrc) {
+    Copy-Item $lemonSrc $scriptsDir -Force
+    Say ("      已复制 LemonUI.SHVDN3.dll  {0:N0} 字节" -f (Get-Item $lemonDst).Length) 'Green'
+} else {
+    Say '!! 警告：找不到 _runtime\LemonUI.SHVDN3.dll' 'Red'
+    Say '   图形面板会因此无法加载（SHVDN 会因缺少依赖而跳过 GTA5Buddy）' 'Red'
+    Say '   请确认从完整的仓库副本运行安装，或把该 DLL 手动放进 scripts\' 'Red'
+}
+
 # --- verify the mod file actually landed, and matches the build ------------
 # A partial install that still prints "完成" is worse than an outright failure, so this
 # compares size and hash against the artifact we meant to install.
