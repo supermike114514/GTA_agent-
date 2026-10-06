@@ -73,7 +73,20 @@ namespace GTA5Buddy
         // lifecycle
         // ------------------------------------------------------------------
 
+        /// <summary>Spawns the companion with the default model.</summary>
         internal bool Spawn()
+        {
+            return SpawnWithModel(BuddyConfig.DefaultModel);
+        }
+
+        /// <summary>
+        /// Spawns the companion with a chosen model, so the panel can let the user pick a skin
+        /// and bring the buddy in already wearing it.
+        ///
+        /// The model has to be streamed in first - CreatePed on a model that is not resident
+        /// yields an invisible or empty ped.
+        /// </summary>
+        internal bool SpawnWithModel(PedHash hash, string label = null)
         {
             try
             {
@@ -84,14 +97,36 @@ namespace GTA5Buddy
                     return false;
                 }
 
-                EnsureRelationshipGroups(player);
-
-                Model model = new Model(BuddyConfig.DefaultModel);
+                Model model = new Model(hash);
                 if (!model.IsPed)
                 {
-                    Notify("~r~生成失败：模型不是人物模型 " + BuddyConfig.DefaultModel);
+                    Notify("~r~生成失败：该模型不是人物模型");
                     return false;
                 }
+
+                // Bring the model in before touching the world.
+                model.Request(1000);
+                int waited = 0;
+                while (!model.IsLoaded && waited < 5000)
+                {
+                    Script.Yield();
+                    waited += 50;
+                }
+                if (!model.IsLoaded)
+                {
+                    Notify("~r~生成失败：模型加载超时（该皮肤可能在本安装中缺失）");
+                    return false;
+                }
+
+                // Already have one? Swap its body instead of leaving a stray behind.
+                if (Exists)
+                {
+                    RequestModelChange(hash);
+                    Notify("~b~队友已在场，正在为他更换皮肤");
+                    return true;
+                }
+
+                EnsureRelationshipGroups(player);
 
                 Vector3 spawnPos = player.Position + (player.ForwardVector * -BuddyConfig.SpawnDistance);
                 Vector3 ground = spawnPos;
@@ -114,13 +149,28 @@ namespace GTA5Buddy
                 _downedSince = 0;
                 _pendingRevive = false;
 
-                Notify("~g~" + BuddyConfig.BuddyName + "已就位~s~  按 " + KeyHint.Toggle +
-                       " 待命/跟随，按 " + KeyHint.Revive + " 施救");
+                Notify("~g~" + (string.IsNullOrEmpty(label) ? BuddyConfig.BuddyName : label + " 队友") +
+                       "已就位~s~  按 " + KeyHint.Toggle + " 待命/跟随，按 " + KeyHint.Revive + " 施救");
                 return true;
             }
             catch (Exception ex)
             {
                 Notify("~r~生成异常: " + ex.Message);
+                return false;
+            }
+        }
+
+        /// <summary>Spawns with the default model, using the string name from config.</summary>
+        internal bool SpawnWithModel(string modelName)
+        {
+            try
+            {
+                Model m = new Model(modelName);
+                return SpawnWithModel((PedHash)m.Hash, modelName);
+            }
+            catch (Exception ex)
+            {
+                BuddyLog.Error("SpawnWithModel(name) failed", ex);
                 return false;
             }
         }
@@ -599,6 +649,308 @@ namespace GTA5Buddy
             catch (Exception ex) { BuddyLog.Error("companion infinite ammo failed", ex); }
         }
 
+        // ==================================================================
+        // 载具能力
+        //
+        // 这些操作默认作用于"玩家驾驶的载具"，若玩家没开车则作用于队友自己的车。
+        // 这样同一个菜单项在两种场景下都符合直觉，不必让用户先选目标。
+        // ==================================================================
+
+        /// <summary>
+        /// The vehicle these actions should act on: the player's when the player is driving,
+        /// otherwise whatever the companion is in. Null when neither is in a car.
+        /// </summary>
+        private Vehicle TargetVehicle()
+        {
+            try
+            {
+                Ped player = Game.Player.Character;
+                if (player != null && player.Exists() && player.IsInVehicle())
+                {
+                    Vehicle v = player.CurrentVehicle;
+                    if (v != null && v.Exists()) return v;
+                }
+
+                Ped buddy = _ped;
+                if (buddy != null && buddy.Exists() && buddy.IsInVehicle())
+                {
+                    Vehicle v = buddy.CurrentVehicle;
+                    if (v != null && v.Exists()) return v;
+                }
+            }
+            catch (Exception) { }
+            return null;
+        }
+
+        /// <summary>Makes the target vehicle immune to damage (and optionally to visual damage).</summary>
+        internal void SetVehicleInvincible(bool on)
+        {
+            try
+            {
+                Vehicle v = TargetVehicle();
+                if (v == null) { Notify("~r~不在载具里"); return; }
+
+                v.IsInvincible = on;
+                Function.Call(Hash.SET_VEHICLE_CAN_BREAK, v, !on);
+                Function.Call(Hash.SET_VEHICLE_STRONG, v, on);
+                Function.Call(Hash.SET_VEHICLE_TYRES_CAN_BURST, v, !on);
+                Function.Call(Hash.SET_VEHICLE_EXPLODES_ON_HIGH_EXPLOSION_DAMAGE, v, !on);
+                Function.Call(Hash.SET_DISABLE_VEHICLE_PETROL_TANK_DAMAGE, v, on);
+
+                if (on)
+                {
+                    // top everything up as well, otherwise a car that was already wrecked
+                    // stays visually wrecked even though it can no longer take damage
+                    Function.Call(Hash.SET_VEHICLE_BODY_HEALTH, v, 1000.0f);
+                    Function.Call(Hash.SET_VEHICLE_ENGINE_HEALTH, v, 1000.0f);
+                    Function.Call(Hash.SET_VEHICLE_PETROL_TANK_HEALTH, v, 1000.0f);
+                }
+                Notify(on ? "~g~载具无敌已开启" : "~y~载具无敌已关闭");
+            }
+            catch (Exception ex) { BuddyLog.Error("SetVehicleInvincible failed", ex); }
+        }
+
+        /// <summary>Raises engine power and torque, giving the target vehicle a speed boost.</summary>
+        internal void SetVehicleBoost(float multiplier)
+        {
+            try
+            {
+                Vehicle v = TargetVehicle();
+                if (v == null) { Notify("~r~不在载具里"); return; }
+
+                v.EnginePowerMultiplier = multiplier;
+                v.EngineTorqueMultiplier = multiplier;
+                Notify("~g~载具动力：" + multiplier + "x");
+            }
+            catch (Exception ex) { BuddyLog.Error("SetVehicleBoost failed", ex); }
+        }
+
+        /// <summary>Restores the target vehicle: body, engine, tank, deformation, wheels, dirt.</summary>
+        internal void RepairVehicle()
+        {
+            try
+            {
+                Vehicle v = TargetVehicle();
+                if (v == null) { Notify("~r~不在载具里"); return; }
+
+                Function.Call(Hash.SET_VEHICLE_FIXED, v);
+                Function.Call(Hash.SET_VEHICLE_DEFORMATION_FIXED, v);
+                Function.Call(Hash.SET_VEHICLE_BODY_HEALTH, v, 1000.0f);
+                Function.Call(Hash.SET_VEHICLE_ENGINE_HEALTH, v, 1000.0f);
+                Function.Call(Hash.SET_VEHICLE_PETROL_TANK_HEALTH, v, 1000.0f);
+                Function.Call(Hash.SET_VEHICLE_DIRT_LEVEL, v, 0.0f);
+                Function.Call(Hash.SET_VEHICLE_WHEELS_CAN_BREAK, v, true);
+                Notify("~g~载具已修好");
+            }
+            catch (Exception ex) { BuddyLog.Error("RepairVehicle failed", ex); }
+        }
+
+        /// <summary>
+        /// Applies a stock "fully modded" build: max engine, brakes, transmission, suspension
+        /// and armour, plus turbo. Armour doubles as the防弹 upgrade, which is why it is maxed.
+        /// </summary>
+        internal void ApplyVehicleModKit()
+        {
+            try
+            {
+                Vehicle v = TargetVehicle();
+                if (v == null) { Notify("~r~不在载具里"); return; }
+
+                // A mod kit must be installed before any mod can be applied.
+                Function.Call(Hash.SET_VEHICLE_MOD_KIT, v, 0);
+
+                var upgrades = new[]
+                {
+                    VehicleModType.Engine,
+                    VehicleModType.Brakes,
+                    VehicleModType.Transmission,
+                    VehicleModType.Suspension,
+                    VehicleModType.Armor,
+                };
+
+                int applied = 0;
+                foreach (VehicleModType type in upgrades)
+                {
+                    try
+                    {
+                        VehicleMod mod = v.Mods[type];
+                        if (mod == null || mod.Count <= 0) continue;
+                        mod.Index = mod.Count - 1;   // highest available level
+                        applied++;
+                    }
+                    catch (Exception) { }
+                }
+
+                Function.Call(Hash.TOGGLE_VEHICLE_MOD, v, 18, true);   // 18 = Turbo
+
+                Notify("~g~已应用改装（性能件 " + applied + " 项 + 涡轮）");
+            }
+            catch (Exception ex) { BuddyLog.Error("ApplyVehicleModKit failed", ex); }
+        }
+
+        /// <summary>Paints the target vehicle and tints its windows.</summary>
+        internal void ApplyVehicleCosmetics(int r, int g, int b, int windowTint, string label)
+        {
+            try
+            {
+                Vehicle v = TargetVehicle();
+                if (v == null) { Notify("~r~不在载具里"); return; }
+
+                Function.Call(Hash.SET_VEHICLE_CUSTOM_PRIMARY_COLOUR, v, r, g, b);
+                Function.Call(Hash.SET_VEHICLE_CUSTOM_SECONDARY_COLOUR, v, r, g, b);
+                if (windowTint >= 0) Function.Call(Hash.SET_VEHICLE_WINDOW_TINT, v, windowTint);
+                Notify("~g~" + label);
+            }
+            catch (Exception ex) { BuddyLog.Error("ApplyVehicleCosmetics failed", ex); }
+        }
+
+        // ==================================================================
+        // 队友自己开车跟随玩家
+        // ==================================================================
+
+        private Vehicle _escortVehicle;
+        private bool _escortMode;
+        private int _nextEscortTask;
+
+        /// <summary>True while the companion is driving its own car to keep up with the player.</summary>
+        internal bool EscortMode { get { return _escortMode; } }
+
+        /// <summary>
+        /// Spawns a car for the companion and puts it in the driver's seat, then keeps it
+        /// driving toward the player. Unlike "上我的车" this gives the buddy its own vehicle,
+        /// so it can follow a player who is on foot or in a different car.
+        /// </summary>
+        internal void OrderVehicleEscort(VehicleHash model)
+        {
+            try
+            {
+                if (!Exists) { Notify("~r~队友不在场"); return; }
+
+                Ped player = Game.Player.Character;
+                if (player == null || !player.Exists()) return;
+
+                // If a buddy car already exists, reuse it rather than littering the map.
+                if (_escortVehicle != null && _escortVehicle.Exists() && !_escortVehicle.IsDead)
+                {
+                    _escortMode = true;
+                    _nextEscortTask = 0;
+                    Notify("~g~队友已开始驾驶跟随");
+                    return;
+                }
+
+                Model carModel = new Model(model);
+                if (!carModel.IsValid) { Notify("~r~载具模型不可用"); return; }
+
+                carModel.Request(1000);
+                int waited = 0;
+                while (!carModel.IsLoaded && waited < 4000)
+                {
+                    Script.Yield();
+                    waited += 50;
+                }
+                if (!carModel.IsLoaded) { Notify("~r~载具模型加载超时"); return; }
+
+                Vector3 pos = player.Position + player.ForwardVector * 8.0f;
+                float groundZ;
+                if (World.GetGroundHeight(pos, out groundZ)) pos = new Vector3(pos.X, pos.Y, groundZ + 0.5f);
+
+                Vehicle car = World.CreateVehicle(carModel, pos, player.Heading);
+                if (car == null || !car.Exists()) { Notify("~r~生成载具失败"); return; }
+
+                car.IsPersistent = true;
+                car.PlaceOnGround();
+                car.IsEngineRunning = true;
+
+                _ped.Task.WarpIntoVehicle(car, VehicleSeat.Driver);
+
+                Function.Call(Hash.SET_DRIVER_ABILITY, _ped, 1.0f);
+                Function.Call(Hash.SET_DRIVER_AGGRESSIVENESS, _ped, 0.5f);
+
+                _escortVehicle = car;
+                _escortMode = true;
+                _nextEscortTask = 0;
+                _state = BuddyState.InVehicle;
+                Notify("~g~已为队友生成载具，他会开车跟随你");
+                BuddyLog.Info("order: companion vehicle escort started, model=" + model);
+            }
+            catch (Exception ex) { BuddyLog.Error("OrderVehicleEscort failed", ex); }
+        }
+
+        /// <summary>Stops the companion's own-car escort and removes that car.</summary>
+        internal void StopVehicleEscort()
+        {
+            try
+            {
+                _escortMode = false;
+                _nextEscortTask = 0;
+
+                if (_escortVehicle != null && _escortVehicle.Exists())
+                {
+                    if (_ped != null && _ped.Exists() && _ped.IsInVehicle())
+                    {
+                        _ped.Task.LeaveVehicle(LeaveVehicleFlags.None);
+                    }
+                    _escortVehicle.Delete();
+                }
+                _escortVehicle = null;
+                _state = BuddyState.Follow;
+                Notify("~y~队友已停止驾驶跟随");
+            }
+            catch (Exception ex) { BuddyLog.Error("StopVehicleEscort failed", ex); }
+        }
+
+        /// <summary>
+        /// Per-tick upkeep for escort mode. The drive task is re-issued on a timer rather than
+        /// every frame: re-tasking each tick makes the car stutter instead of drive.
+        /// </summary>
+        private void UpdateVehicleEscort(Ped player)
+        {
+            if (!_escortMode) return;
+
+            try
+            {
+                if (_escortVehicle == null || !_escortVehicle.Exists() || _escortVehicle.IsDead)
+                {
+                    _escortMode = false;
+                    _escortVehicle = null;
+                    return;
+                }
+
+                // Nothing to do while the player is riding with us.
+                if (player.IsInVehicle() && player.CurrentVehicle == _escortVehicle) return;
+
+                // Make sure the buddy is actually behind the wheel; it can be dragged out.
+                if (!_ped.IsInVehicle() || _ped.CurrentVehicle != _escortVehicle)
+                {
+                    if (Game.GameTime - _enterVehicleIssuedAt > 3000)
+                    {
+                        _enterVehicleIssuedAt = Game.GameTime;
+                        _ped.Task.WarpIntoVehicle(_escortVehicle, VehicleSeat.Driver);
+                    }
+                    return;
+                }
+
+                // Re-issue the drive-to-player task on a timer, and sooner if we fell behind.
+                float distance = _escortVehicle.Position.DistanceTo(player.Position);
+                bool farBehind = distance > 40.0f;
+                if (!farBehind && Game.GameTime < _nextEscortTask) return;
+
+                _nextEscortTask = Game.GameTime + 2500;
+
+                Vector3 dest = player.Position;
+                float speed = farBehind ? 30.0f : 18.0f;
+                float stopRange = farBehind ? 12.0f : 8.0f;
+                const int driveMode = 786603;   // 常规驾驶 + 避开行人/车辆
+
+                Function.Call(Hash.TASK_VEHICLE_DRIVE_TO_COORD,
+                              _ped, _escortVehicle,
+                              dest.X, dest.Y, dest.Z,
+                              speed, 0, _escortVehicle.Model.Hash,
+                              driveMode, stopRange, 1.0f);
+            }
+            catch (Exception ex) { BuddyLog.Error("UpdateVehicleEscort failed", ex); }
+        }
+
         private void EnsureRelationshipGroups(Ped player)
         {
             try
@@ -655,6 +1007,16 @@ namespace GTA5Buddy
             {
                 Ped player = Game.Player.Character;
                 if (player == null || !player.Exists()) return;
+
+                // 队友自己开车跟随：独立于状态机的支线。生存保护和 HUD 仍要照常跑，
+                // 否则开车跟随期间队友不会吃药、HUD 也会停在旧状态。
+                if (_escortMode)
+                {
+                    UpdateVehicleEscort(player);
+                    GuardSurvival(player);
+                    _hud.Draw(_ped, "驾驶跟随");
+                    return;
+                }
 
                 BuddyState next = DecideState(player);
                 if (next != _state)

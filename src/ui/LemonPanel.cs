@@ -43,6 +43,8 @@ namespace GTA5Buddy
         // 队友专属：皮肤与武器。队友的装备不该和玩家混在一起，所以单独成页。
         private readonly NativeMenu _buddySkin;
         private readonly NativeMenu _buddySkinCategories;
+        private readonly NativeMenu _buddySpawnSkin;
+        private readonly NativeMenu _buddySpawnSkinCategories;
         private readonly NativeMenu _buddyWeapons;
 
         private bool _wired;
@@ -76,6 +78,8 @@ namespace GTA5Buddy
             _stats = new NativeMenu("人物与武器", "血量 / 护甲 / 弹药");
             _buddySkin = new NativeMenu("队友皮肤", "直接把队友换成该模型");
             _buddySkinCategories = new NativeMenu("队友皮肤分类", "选定后返回模型列表");
+            _buddySpawnSkin = new NativeMenu("召唤队友（指定皮肤）", "用选中的皮肤把队友叫出来");
+            _buddySpawnSkinCategories = new NativeMenu("召唤用皮肤分类", "选定后返回模型列表");
             _buddyWeapons = new NativeMenu("队友武器", "为队友配枪与弹药");
 
             _pool.Add(_root);
@@ -87,6 +91,8 @@ namespace GTA5Buddy
             _pool.Add(_stats);
             _pool.Add(_buddySkin);
             _pool.Add(_buddySkinCategories);
+            _pool.Add(_buddySpawnSkin);
+            _pool.Add(_buddySpawnSkinCategories);
             _pool.Add(_buddyWeapons);
 
             WireMenus();
@@ -166,6 +172,8 @@ namespace GTA5Buddy
                 RebuildSkins();
                 RebuildBuddySkinCategories();
                 RebuildBuddySkin();
+                RebuildSpawnSkinCategories();
+                RebuildBuddySpawnSkin();
                 BuddyLog.Info("lemon panel: skin catalogue ready, " + _skinData.TotalCount + " models");
             }
         }
@@ -177,11 +185,12 @@ namespace GTA5Buddy
             _root.AddSubMenu(_commands);
             _root.AddSubMenu(_spawner);
             _root.AddSubMenu(_stats);
-            _root.AddSubMenu(_buddySkin);
-            _root.AddSubMenu(_buddyWeapons);
 
             _spawner.AddSubMenu(_vehicles);
             _spawner.AddSubMenu(_skins);
+            // 队友相关的都收在生成器下，主菜单只留三项
+            _spawner.AddSubMenu(_buddySkin);
+            _spawner.AddSubMenu(_buddyWeapons);
 
             AddAction(_commands, "跟随我", "同伴跟随玩家", delegate { _buddy.OrderFollow(); });
             AddAction(_commands, "原地待命", "留在当前位置", delegate { _buddy.OrderStay(); });
@@ -318,6 +327,8 @@ namespace GTA5Buddy
             RebuildSkins();
             RebuildBuddySkinCategories();
             RebuildBuddySkin();
+            RebuildSpawnSkinCategories();
+            RebuildBuddySpawnSkin();
         }
 
         private void RebuildCategories()
@@ -367,6 +378,36 @@ namespace GTA5Buddy
                 _categories.Visible = true;
             };
             _vehicles.Add(catItem);
+
+            // ---- 载具功能：作用于"玩家正在开的车"，玩家没开车时作用于队友的车 ----
+            AddAction(_vehicles, "载具 · 无敌 开", "免疫损坏、不爆胎、不爆炸", delegate
+                { _buddy.SetVehicleInvincible(true); });
+            AddAction(_vehicles, "载具 · 无敌 关", "恢复正常受损", delegate
+                { _buddy.SetVehicleInvincible(false); });
+            AddAction(_vehicles, "载具 · 加速 2x", "引擎动力与扭矩翻倍", delegate
+                { _buddy.SetVehicleBoost(2.0f); });
+            AddAction(_vehicles, "载具 · 加速 4x", "极速", delegate
+                { _buddy.SetVehicleBoost(4.0f); });
+            AddAction(_vehicles, "载具 · 加速 恢复正常", "回到 1x", delegate
+                { _buddy.SetVehicleBoost(1.0f); });
+            AddAction(_vehicles, "载具 · 修复（车身+引擎+油路）", "同时去除变形与污渍", delegate
+                { _buddy.RepairVehicle(); });
+            AddAction(_vehicles, "载具 · 一键改装", "性能件拉满 + 涡轮 + 装甲", delegate
+                { _buddy.ApplyVehicleModKit(); });
+            AddAction(_vehicles, "载具 · 涂装 哑光黑", "全车改色 + 深色车窗", delegate
+                { _buddy.ApplyVehicleCosmetics(10, 10, 10, 2, "已改为哑光黑"); });
+            AddAction(_vehicles, "载具 · 涂装 亮红", "全车改色", delegate
+                { _buddy.ApplyVehicleCosmetics(220, 20, 20, 1, "已改为亮红"); });
+            AddAction(_vehicles, "载具 · 涂装 亮黄", "全车改色", delegate
+                { _buddy.ApplyVehicleCosmetics(240, 210, 30, 1, "已改为亮黄"); });
+
+            // ---- 队友自己的车 ----
+            AddAction(_vehicles, "队友 · 为他生成载具并开车跟随", "队友开车跟着你移动", delegate
+                { _buddy.OrderVehicleEscort(VehicleHash.Zentorno); });
+            AddAction(_vehicles, "队友 · 用警车开车跟随", "同上，换成警车", delegate
+                { _buddy.OrderVehicleEscort(VehicleHash.Police); });
+            AddAction(_vehicles, "队友 · 停止开车跟随", "移除队友的车", delegate
+                { _buddy.StopVehicleEscort(); });
 
             int shown = 0;
             foreach (VehiclePanel.Entry e in _vehicleData.VisibleEntries())
@@ -418,14 +459,21 @@ namespace GTA5Buddy
         // companion skin (replaces the companion's model instead of spawning an NPC)
         // ------------------------------------------------------------------
 
-        private void RebuildBuddySkinCategories()
+        /// <summary>
+        /// Builds the category browser for a skin page.
+        ///
+        /// The two skin pages differ only in what activating a model does (swap the buddy's
+        /// body vs. spawn the buddy wearing it), so the menu plumbing is shared here rather
+        /// than duplicated across four near-identical methods.
+        /// </summary>
+        private void BuildSkinCategories(NativeMenu target, NativeMenu modelMenu, bool spawnMode)
         {
-            _buddySkinCategories.Clear();
+            target.Clear();
 
             if (!_skinData.Built)
             {
-                _buddySkinCategories.Add(new NativeItem("人物模型数据库正在建立…",
-                                                        "已索引 " + _skinData.TotalCount + " 个模型"));
+                target.Add(new NativeItem("人物模型数据库正在建立…",
+                                          "已索引 " + _skinData.TotalCount + " 个模型"));
                 return;
             }
 
@@ -439,42 +487,58 @@ namespace GTA5Buddy
                 item.Activated += delegate
                 {
                     _skinData.SetCategory(captured);
-                    RebuildBuddySkin();
-                    _buddySkinCategories.Visible = false;
-                    _buddySkin.Visible = true;
+                    BuildSkinList(modelMenu, spawnMode);
+                    target.Visible = false;
+                    modelMenu.Visible = true;
                 };
-                _buddySkinCategories.Add(item);
+                target.Add(item);
             }
 
-            if (_buddySkinCategories.Items.Count == 0)
+            if (target.Items.Count == 0)
             {
-                _buddySkinCategories.Add(new NativeItem("(没有可用分类)", string.Empty));
+                target.Add(new NativeItem("(没有可用分类)", string.Empty));
             }
         }
 
-        private void RebuildBuddySkin()
+        /// <summary>
+        /// Fills a skin page's model list. spawnMode true  = 用该皮肤召唤队友；
+        /// spawnMode false = 把已在场的队友换成该皮肤。
+        /// </summary>
+        private void BuildSkinList(NativeMenu target, bool spawnMode)
         {
-            _buddySkin.Clear();
+            target.Clear();
 
             var catItem = new NativeItem("分类浏览    [" + _skinData.CategoryLabel + "]",
-                                         "按分类挑选队友皮肤");
+                                         "按分类挑选");
             catItem.Activated += delegate
             {
-                _buddySkin.Visible = false;
-                _buddySkinCategories.Visible = true;
+                target.Visible = false;
+                NativeMenu categories = spawnMode ? _buddySpawnSkinCategories : _buddySkinCategories;
+                BuildSkinCategories(categories, target, spawnMode);
+                categories.Visible = true;
             };
-            _buddySkin.Add(catItem);
+            target.Add(catItem);
 
-            AddAction(_buddySkin, "恢复默认外观", "换回初始队友模型", delegate
-                { _buddy.RequestModelChange(DefaultBuddyModel); });
+            AddAction(target,
+                      spawnMode ? "用默认皮肤召唤" : "恢复默认外观",
+                      spawnMode ? "s_m_m_security_01" : "换回初始队友模型",
+                      delegate
+                      {
+                          if (spawnMode) _buddy.SpawnWithModel(DefaultBuddyModel);
+                          else _buddy.RequestModelChange(DefaultBuddyModel);
+                      });
 
             int shown = 0;
             foreach (SkinPanel.Entry e in _skinData.VisibleEntries())
             {
                 SkinPanel.Entry captured = e;
                 var item = new NativeItem(captured.Label, captured.CategoryName);
-                item.Activated += delegate { _buddy.RequestModelChange(captured.Hash); };
-                _buddySkin.Add(item);
+                item.Activated += delegate
+                {
+                    if (spawnMode) _buddy.SpawnWithModel(captured.Hash, captured.Label);
+                    else _buddy.RequestModelChange(captured.Hash);
+                };
+                target.Add(item);
 
                 shown++;
                 if (shown >= 300) break;
@@ -482,9 +546,29 @@ namespace GTA5Buddy
 
             if (shown == 0 && !_skinData.Built)
             {
-                _buddySkin.Add(new NativeItem("人物模型数据库正在建立…",
-                                              "已索引 " + _skinData.TotalCount + " 个模型"));
+                target.Add(new NativeItem("人物模型数据库正在建立…",
+                                          "已索引 " + _skinData.TotalCount + " 个模型"));
             }
+        }
+
+        private void RebuildBuddySpawnSkin()
+        {
+            BuildSkinList(_buddySpawnSkin, true);
+        }
+
+        private void RebuildBuddySkinCategories()
+        {
+            BuildSkinCategories(_buddySkinCategories, _buddySkin, false);
+        }
+
+        private void RebuildSpawnSkinCategories()
+        {
+            BuildSkinCategories(_buddySpawnSkinCategories, _buddySpawnSkin, true);
+        }
+
+        private void RebuildBuddySkin()
+        {
+            BuildSkinList(_buddySkin, false);
         }
 
         private void UpdateSubtitle()
