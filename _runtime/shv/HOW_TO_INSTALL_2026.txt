@@ -1,0 +1,24 @@
+1. Copy the contents of "bin\" folder to the game's main folder, 
+   i.e. where GTA5.exe is located.
+   
+2. For the most users additional actions are not required, since
+   the ingame anticheat is disabled with copying "args.txt" to
+   the game's main folder.
+   
+3. If for some reason the battleye anticheat still pops up there
+   are few other ways to disable this:
+   
+   [Option 1]
+   - Remove "GTA5_BE.exe" from the game's main folder
+   - Launch the game
+   - When the launcher pops up saying about missing files just
+     click on [Retry] button.
+   
+   [Option 2]
+   - Windows start menu -> Rockstar Games Launcher
+   - In the launcher click [settings] in the top-right corner
+   - Uncheck BattleEye checkbox on the settings screen you are
+   - In the list of games in the settings click on GTAV
+   - Scroll down to [launch arguments] and put "-nobattleye" in
+     there (without quotes)
+   - Launch the game!

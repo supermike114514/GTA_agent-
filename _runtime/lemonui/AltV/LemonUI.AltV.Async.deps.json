@@ -1,0 +1,92 @@
+{
+  "runtimeTarget": {
+    "name": ".NETCoreApp,Version=v6.0",
+    "signature": ""
+  },
+  "compilationOptions": {},
+  "targets": {
+    ".NETCoreApp,Version=v6.0": {
+      "LemonUI.AltV.Async/2.2": {
+        "dependencies": {
+          "AltV.Net.Client.Async": "16.3.4",
+          "StyleCop.Analyzers": "1.2.0-beta.556"
+        },
+        "runtime": {
+          "LemonUI.AltV.Async.dll": {}
+        }
+      },
+      "AltV.Net.CApi/16.3.4": {},
+      "AltV.Net.Client/16.3.4": {
+        "dependencies": {
+          "AltV.Net.CApi": "16.3.4",
+          "AltV.Net.Shared": "16.3.4"
+        }
+      },
+      "AltV.Net.Client.Async/16.3.4": {
+        "dependencies": {
+          "AltV.Net.Client": "16.3.4"
+        }
+      },
+      "AltV.Net.Shared/16.3.4": {
+        "dependencies": {
+          "AltV.Net.CApi": "16.3.4"
+        }
+      },
+      "StyleCop.Analyzers/1.2.0-beta.556": {
+        "dependencies": {
+          "StyleCop.Analyzers.Unstable": "1.2.0.556"
+        }
+      },
+      "StyleCop.Analyzers.Unstable/1.2.0.556": {}
+    }
+  },
+  "libraries": {
+    "LemonUI.AltV.Async/2.2": {
+      "type": "project",
+      "serviceable": false,
+      "sha512": ""
+    },
+    "AltV.Net.CApi/16.3.4": {
+      "type": "package",
+      "serviceable": true,
+      "sha512": "sha512-NVFcSUsKgEm+LkJIg+TcI7/hHTXd3YtQnrIzK3I3ob6ltxM+K4kamEmAAz+qDQjpFSQF2jIKqP7bnR6G2a9RgQ==",
+      "path": "altv.net.capi/16.3.4",
+      "hashPath": "altv.net.capi.16.3.4.nupkg.sha512"
+    },
+    "AltV.Net.Client/16.3.4": {
+      "type": "package",
+      "serviceable": true,
+      "sha512": "sha512-dKNBM/QFC7dfxHEr0oDncZFRkvpUxBCz4IdVa8cvEq/t30tsOWCdP1qqa8MHYsWo6prGTXonkuO9jw+1oR3mOg==",
+      "path": "altv.net.client/16.3.4",
+      "hashPath": "altv.net.client.16.3.4.nupkg.sha512"
+    },
+    "AltV.Net.Client.Async/16.3.4": {
+      "type": "package",
+      "serviceable": true,
+      "sha512": "sha512-HU+3B5i5xOVZnGmDJglTaUfmcRxDXE1waMUZIJN1QEaGCqCLWjAvzIr65SMGxnB3FsihKhtWFL+2yZNrq8BrwA==",
+      "path": "altv.net.client.async/16.3.4",
+      "hashPath": "altv.net.client.async.16.3.4.nupkg.sha512"
+    },
+    "AltV.Net.Shared/16.3.4": {
+      "type": "package",
+      "serviceable": true,
+      "sha512": "sha512-Jaug5Pnv3RC9O5GPPuWNbzflJoKi6a8q30hkNzODEztOHnFmUcXZJMxeQqKVSGcPZKq8s+uAkrUXKEyI4i1tZA==",
+      "path": "altv.net.shared/16.3.4",
+      "hashPath": "altv.net.shared.16.3.4.nupkg.sha512"
+    },
+    "StyleCop.Analyzers/1.2.0-beta.556": {
+      "type": "package",
+      "serviceable": true,
+      "sha512": "sha512-llRPgmA1fhC0I0QyFLEcjvtM2239QzKr/tcnbsjArLMJxJlu0AA5G7Fft0OI30pHF3MW63Gf4aSSsjc5m82J1Q==",
+      "path": "stylecop.analyzers/1.2.0-beta.556",
+      "hashPath": "stylecop.analyzers.1.2.0-beta.556.nupkg.sha512"
+    },
+    "StyleCop.Analyzers.Unstable/1.2.0.556": {
+      "type": "package",
+      "serviceable": true,
+      "sha512": "sha512-zvn9Mqs/ox/83cpYPignI8hJEM2A93s2HkHs8HYMOAQW0PkampyoErAiIyKxgTLqbbad29HX/shv/6LGSjPJNQ==",
+      "path": "stylecop.analyzers.unstable/1.2.0.556",
+      "hashPath": "stylecop.analyzers.unstable.1.2.0.556.nupkg.sha512"
+    }
+  }
+}

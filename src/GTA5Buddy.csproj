@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="15.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup>
+    <Configuration Condition=" '$(Configuration)' == '' ">Release</Configuration>
+    <Platform Condition=" '$(Platform)' == '' ">x64</Platform>
+    <ProjectGuid>{7B1D4E11-9A54-4C3B-9F1E-2A6D8C0E5F31}</ProjectGuid>
+    <OutputType>Library</OutputType>
+    <RootNamespace>GTA5Buddy</RootNamespace>
+    <AssemblyName>GTA5Buddy</AssemblyName>
+    <TargetFrameworkVersion>v4.8</TargetFrameworkVersion>
+    <PlatformTarget>x64</PlatformTarget>
+    <LangVersion>latest</LangVersion>
+    <OutputPath>..\build\</OutputPath>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <Optimize>true</Optimize>
+    <DebugType>none</DebugType>
+    <WarningLevel>4</WarningLevel>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <AssemblyVersion>1.0.0.0</AssemblyVersion>
+    <FileVersion>1.0.0.0</FileVersion>
+    <ShaderDir>..\_runtime\shvdne</ShaderDir>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Reference Include="System" />
+    <Reference Include="System.Core" />
+    <Reference Include="System.Drawing" />
+    <Reference Include="System.Windows.Forms" />
+    <Reference Include="System.Xml" />
+    <Reference Include="ScriptHookVDotNet3">
+      <HintPath>..\_runtime\shvdne\ScriptHookVDotNet3.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Include="AssemblyInfo.cs" />
+    <Compile Include="BuddyLog.cs" />
+    <Compile Include="BuddyMain.cs" />
+    <Compile Include="Companion.cs" />
+    <Compile Include="BuddyConfig.cs" />
+    <Compile Include="BuddyHud.cs" />
+    <Compile Include="KeyHint.cs" />
+    <Compile Include="OnlineGuard.cs" />
+  </ItemGroup>
+
+  <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
+</Project>

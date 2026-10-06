@@ -1,0 +1,4 @@
+H:\deepseek\GTA5Buddy\src\obj\x64\Release\GTA5Buddy.csproj.AssemblyReference.cache
+H:\deepseek\GTA5Buddy\src\obj\x64\Release\GTA5Buddy.csproj.CoreCompileInputs.cache
+H:\deepseek\GTA5Buddy\build\GTA5Buddy.dll
+H:\deepseek\GTA5Buddy\src\obj\x64\Release\GTA5Buddy.dll
