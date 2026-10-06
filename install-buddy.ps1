@@ -192,6 +192,38 @@ if ($srcLen -ne $dstLen -or $srcHash -ne $dstHash) {
 Say ''
 Say ("      [校验通过] GTA5Buddy.dll {0:N0} 字节，SHA256 与构建产物一致" -f $dstLen) 'Green'
 
+# --- verify the runtime landed too -----------------------------------------
+# 只校验 GTA5Buddy.dll 是不够的：真正决定"游戏里有没有反应"的是 dinput8.dll（ASI 加载器）
+# 和 ScriptHookVDotNet.asi。它们缺失时 ScriptHookV 根本不会加载任何脚本，
+# 表现就是"安装程序说完成，但进游戏毫无反应"——所以这里逐个复核。
+$expected = @(
+    'ScriptHookV.dll', 'dinput8.dll', 'xinput1_4.dll', 'args.txt', 'NativeTrainer.asi',
+    'ScriptHookVDotNet.asi', 'ScriptHookVDotNet3.dll', 'ScriptHookVDotNet.ini', 'MinHook.x64.dll'
+)
+$missing = @()
+foreach ($name in $expected) {
+    $p = Join-Path $Game $name
+    if (-not (Test-Path $p)) { $missing += $name }
+}
+if (-not (Test-Path $lemonDst)) { $missing += 'scripts\LemonUI.SHVDN3.dll' }
+
+if ($missing.Count -gt 0) {
+    Say ''
+    Say '!! 校验失败：以下文件没有出现在游戏目录里：' 'Red'
+    foreach ($m in $missing) { Say "     $m" 'Red' }
+    Say ''
+    Say '   这意味着脚本运行时不完整，游戏里不会有任何反应。' 'Yellow'
+    Say '   最常见的原因：' 'Yellow'
+    Say '     1) 杀毒软件把这些文件当木马删掉了（dinput8.dll 是重点查杀对象）' 'Yellow'
+    Say '        -> 在杀软里给游戏目录加白名单，然后重新安装' 'Yellow'
+    Say '     2) 安装时 GTA V 仍在运行，文件被占用' 'Yellow'
+    Say '        -> 完全退出游戏后重新运行本程序' 'Yellow'
+    Say ''
+    if (-not $NoPause) { Read-Host '按回车退出' | Out-Null }
+    exit 1
+}
+Say ("      [校验通过] 9 个运行时文件 + LemonUI 依赖全部就位") 'Green'
+
 # config template: placed in the GAME ROOT, which is proven writable by the game process
 # (ScriptHookV.log lives there). Only seeded when absent so user edits are never clobbered.
 $iniSrc = Join-Path $Root 'GTA5Buddy.ini'

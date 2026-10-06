@@ -40,6 +40,15 @@ if (Test-Path $modDll) {
 $blog = Join-Path $scripts 'GTA5Buddy.log'
 if (Test-Path $blog) { Remove-Item $blog -Force; Say "已删除 $blog" 'Green' }
 
+# LemonUI is a hard dependency of the graphical panel and lives in scripts\ too.
+# Leaving it behind is harmless for a reinstall (the installer overwrites it) but it
+# means "uninstall" did not actually remove everything, so remove it here as well.
+$lemonDll = Join-Path $scripts 'LemonUI.SHVDN3.dll'
+if (Test-Path $lemonDll) {
+    Remove-Item $lemonDll -Force
+    Say "已删除 $lemonDll" 'Green'
+}
+
 # a junction pointing at the build output is a different beast - remove the link, not the target
 $item = Get-Item $scripts -Force -ErrorAction SilentlyContinue
 if ($item -and ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
@@ -83,5 +92,28 @@ if (Test-Path $backupRoot) {
 
 Say ''
 Say '卸载完成。' 'Cyan'
+
+# --- 清理累积的备份目录 -----------------------------------------------------
+# 安装程序每次运行都会新建一个 _mod_backup\<时间戳>\，只备份它实际覆盖过的文件。
+# 反复安装/卸载会攒下几十个这种目录，所以这里顺手问一句。
+if (Test-Path $backupRoot) {
+    $dirs = @(Get-ChildItem $backupRoot -Directory)
+    $files = @(Get-ChildItem $backupRoot -Recurse -File)
+    if ($dirs.Count -gt 0) {
+        Say ''
+        Say ("发现 {0} 个备份目录，共 {1} 个文件。" -f $dirs.Count, $files.Count) 'Yellow'
+        Say '备份里放的是安装时被覆盖掉的原文件（例如你自己原有的 ScriptHookV）。' 'DarkGray'
+        if (-not $NoPause) {
+            $ans = Read-Host '要一并删除这些备份吗？(y = 删除 / 其它键 = 保留)'
+            if ($ans -eq 'y' -or $ans -eq 'Y') {
+                Remove-Item $backupRoot -Recurse -Force
+                Say '已删除全部备份目录。' 'Green'
+            } else {
+                Say "已保留，位置：$backupRoot" 'Gray'
+            }
+        }
+    }
+}
+
 Say ''
 if (-not $NoPause) { Read-Host '按回车结束' | Out-Null }
