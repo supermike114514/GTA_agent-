@@ -1,0 +1,42 @@
+# ---------------------------------------------------------------------------
+# 第三方运行时二进制 —— 刻意不纳入版本库
+#
+# 理由有两个，缺一不可：
+#
+#   1. 许可：ScriptHookV SDK 的 readme.txt 第一行就写明
+#        "; THIS ARCHIVE REDISTRIBUTION IS NOT ALLOWED, USE THE FOLLOWING LINK INSTEAD"
+#      把 ScriptHookV.dll / dinput8.dll / SDK 直接放进公开仓库属于再分发，不允许。
+#      ScriptHookVDotNet 与 LemonUI 各有其许可，同样应由使用者自行获取。
+#
+#   2. 体积：本目录约 24 MB，其中大半是 zip 与 pdb，对源码仓库没有价值。
+#
+# 安装脚本会引导使用者自己放置这些文件，README 的安装章节也逐条列出了清单。
+# ---------------------------------------------------------------------------
+_runtime/
+
+# 构建产物：由 src\build-roslyn.ps1 生成
+# 注意 build\GTA5Buddy.dll 是**刻意收录**的：使用者可以直接取用，不必自己编译。
+# 所以这里不忽略整个 build\，只忽略其中的杂项。
+build/*.pdb
+build/*.log
+
+# 临时文件与诊断输出
+_tmp/
+_aclreports/
+*.log
+
+# C++ 编译中间产物
+cpp/*.obj
+cpp/*.pdb
+cpp/*.ilk
+cpp/*.exp
+cpp/*.lib
+cpp/GTA5BuddyPanel.asi
+
+# 编辑器 / 系统
+.vs/
+.idea/
+*.user
+*.suo
+Thumbs.db
+desktop.ini
