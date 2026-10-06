@@ -28,6 +28,12 @@ namespace GTA5Buddy
     internal sealed class Companion
     {
         private Ped _ped;
+
+        /// <summary>
+        /// 本队友的皮肤。生成、死亡补位、换皮肤都更新它，
+        /// 这样一个队友在整局里始终保持同一张脸。
+        /// </summary>
+        private PedHash _spawnModel = BuddyConfig.DefaultPedHash;
         private Blip _blip;
         private RelationshipGroup _group;
         private bool _groupCreated;
@@ -76,7 +82,7 @@ namespace GTA5Buddy
         /// <summary>Spawns the companion with the default model.</summary>
         internal bool Spawn()
         {
-            return SpawnWithModel(BuddyConfig.DefaultModel);
+            return SpawnWithModel(_spawnModel);
         }
 
         /// <summary>
@@ -88,6 +94,7 @@ namespace GTA5Buddy
         /// </summary>
         internal bool SpawnWithModel(PedHash hash, string label = null)
         {
+            _spawnModel = hash;
             try
             {
                 Ped player = Game.Player.Character;
@@ -484,6 +491,7 @@ namespace GTA5Buddy
         /// </summary>
         internal void RequestModelChange(PedHash hash)
         {
+            _spawnModel = hash;
             try
             {
                 if (!Exists)
@@ -957,7 +965,9 @@ namespace GTA5Buddy
             {
                 if (!_groupCreated)
                 {
-                    _group = World.AddRelationshipGroup(BuddyConfig.RelationshipGroupName);
+                    // 每个队友用唯一的关系组名。多实例共用同一个名字会让引擎把两个队友
+                    // 当成同一组处理，互相之间的关系与伤害过滤都会错乱。
+                    _group = World.AddRelationshipGroup(_relationshipGroupName);
                     _groupCreated = true;
                     Function.Call(Hash.SET_RELATIONSHIP_BETWEEN_GROUPS, 0, _group, _group, "BUDDY");
                 }
@@ -975,6 +985,35 @@ namespace GTA5Buddy
                 _groupCreated = false;
             }
         }
+
+        // ==================================================================
+        // 小队支持
+        // ==================================================================
+
+        private string _relationshipGroupName = BuddyConfig.RelationshipGroupName;
+        private int _squadIndex;
+
+        /// <summary>
+        /// 队伍编号。用于生成唯一的关系组名，并决定谁负责画 HUD。
+        /// 由 AgentSquad 在创建实例后立即调用。
+        /// </summary>
+        internal void SetSquadIdentity(int index)
+        {
+            _squadIndex = index;
+            _relationshipGroupName = BuddyConfig.RelationshipGroupName + "_" + index;
+        }
+
+        /// <summary>由 AgentSquad 指定这一位的皮肤（生成前调用）。</summary>
+        internal void SetSpawnModel(PedHash hash) { _spawnModel = hash; }
+
+        /// <summary>
+        /// 是否绘制 HUD。多个队友同时画会在同一屏幕位置叠成一团，
+        /// 所以只有队伍里的第一个队友开启。
+        /// </summary>
+        internal bool ShowHud { get; set; }
+
+        /// <summary>队伍编号（0 表示第一个）。</summary>
+        internal int SquadIndex { get { return _squadIndex; } }
 
         private void AttachBlip()
         {
@@ -1014,7 +1053,7 @@ namespace GTA5Buddy
                 {
                     UpdateVehicleEscort(player);
                     GuardSurvival(player);
-                    _hud.Draw(_ped, "驾驶跟随");
+                    if (ShowHud) _hud.Draw(_ped, "驾驶跟随");
                     return;
                 }
 
@@ -1041,7 +1080,7 @@ namespace GTA5Buddy
                     GuardSurvival(player);
                 }
 
-                _hud.Draw(_ped, _state + " (" + _stateReason + ")");
+                if (ShowHud) _hud.Draw(_ped, _state + " (" + _stateReason + ")");
             }
             catch (Exception)
             {

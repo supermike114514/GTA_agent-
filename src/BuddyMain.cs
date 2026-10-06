@@ -20,7 +20,9 @@ namespace GTA5Buddy
     /// </summary>
     public class BuddyMain : Script
     {
-        private readonly Companion _buddy = new Companion();
+        // 队伍而非单个队友：面板可以生成任意数量的队友，"指令"作用于全部。
+        // _buddy 保留为队伍里的第一个实例（0 号），用于按键 J/K 这类单人操作。
+        private readonly AgentSquad _squad = new AgentSquad();
         private readonly MenuController _menu;
         private readonly LemonPanel _panel;
         private bool _autoSpawnDone;
@@ -29,6 +31,9 @@ namespace GTA5Buddy
         private bool _spawnReported;
         private bool _onlineRefusalReported;
         private bool _controlToggleProven;
+
+        /// <summary>0 号队友；不存在时按需创建（这样 J 键总有对象可发）。</summary>
+        private Companion Buddy { get { return _squad.EnsureAtLeastOne(); } }
 
         public BuddyMain()
         {
@@ -40,10 +45,10 @@ namespace GTA5Buddy
             KeyDown += OnKeyDown;
             Aborted += OnAborted;
 
-            _menu = new MenuController(_buddy);
+            _menu = new MenuController(Buddy);
             // LemonUI draws through GTA's Scaleform UI system, which is the only graphics path
             // that renders on this setup; the old MenuController stays for its catalogue logic.
-            _panel = new LemonPanel(_buddy, _menu.Vehicles, _menu.Skins);
+            _panel = new LemonPanel(_squad, _menu.Vehicles, _menu.Skins);
 
             string detail;
             _allowedToRun = OnlineGuard.IsStoryMode(out detail);
@@ -110,7 +115,7 @@ namespace GTA5Buddy
                     ReportRefusal(detail, true);
                     _allowedToRun = false;
                     _autoSpawnDone = false;
-                    _buddy.Despawn();
+                    _squad.DespawnAll();
                     return;
                 }
 
@@ -127,11 +132,8 @@ namespace GTA5Buddy
                 }
 
                 // A dead companion is replaced rather than left as a corpse forever.
-                if (_autoSpawnDone && _buddy.Exists && _buddy.Ped.IsDead)
-                {
-                    BuddyLog.Info("companion died; respawning");
-                    _buddy.ReplaceDeadPed();
-                }
+                // 队友死亡后由队伍逐个补位（多队友时只补死掉的那个）
+                if (_autoSpawnDone) ReplaceDeadAgents();
 
                 ReportSpawnOnce();
 
@@ -146,7 +148,7 @@ namespace GTA5Buddy
                 // LemonUI handles its own navigation, drawing and input while open.
                 _panel.Update();
 
-                _buddy.Update();
+                _squad.Update();
             }
             catch (Exception ex)
             {
@@ -175,7 +177,7 @@ namespace GTA5Buddy
                 // likely to be misbehaving.
                 if (e.KeyCode == KeyHint.ReportKey)
                 {
-                    BuddyDiagnostics.Dump(_buddy, _menu);
+                    BuddyDiagnostics.Dump(Buddy, _menu);
                     return;
                 }
 
@@ -189,12 +191,12 @@ namespace GTA5Buddy
                 switch (e.KeyCode)
                 {
                     case Keys.J:
-                        if (_buddy.Exists) _buddy.Despawn();
+                        if (_squad.AnyExists()) _squad.DespawnAll();
                         else SpawnCompanion();
                         break;
 
                     case Keys.K:
-                        _buddy.ToggleStandby();
+                        _squad.OrderStay();
                         break;
                 }
             }
@@ -208,7 +210,7 @@ namespace GTA5Buddy
                 BuddyLog.Info("script aborted (reload or session end)");
                 // Give the ped back to the engine but drop our blip, so a script reload does
                 // not stack blips. Recall with J afterwards.
-                _buddy.Despawn();
+                _squad.DespawnAll();
             }
             catch (Exception) { }
         }
@@ -251,7 +253,7 @@ namespace GTA5Buddy
         /// </summary>
         internal bool SpawnCompanion()
         {
-            bool ok = _buddy.Spawn();
+            bool ok = Buddy.Spawn();
             try
             {
                 Ped player = Game.Player.Character;
@@ -275,16 +277,37 @@ namespace GTA5Buddy
             if (_spawnReported) return;
             _spawnReported = true;
 
-            if (!_buddy.Exists)
+            if (!_squad.AnyExists())
             {
                 BuddyLog.Warn("companion does not exist after the spawn attempt - see the auto-spawn line above");
                 return;
             }
 
-            Ped p = _buddy.Ped;
+            Ped p = Buddy.Ped;
             BuddyLog.Info(string.Format(
                 "companion: health={0}/{1} armor={2} persistent={3} model={4} pos={5}",
                 p.Health, p.MaxHealth, p.Armor, p.IsPersistent, p.Model.Hash, p.Position.ToString()));
+        }
+
+        /// <summary>
+        /// 逐个补位：多队友时只重新生成死掉的那个，不会把整队换掉。
+        ///
+        /// Companion.ReplaceDeadPed 只处理自己这一位，所以这里遍历队伍逐个询问即可。
+        /// </summary>
+        private void ReplaceDeadAgents()
+        {
+            try
+            {
+                foreach (Companion agent in _squad.Snapshot())
+                {
+                    if (!agent.Exists) continue;
+                    if (agent.Ped == null || !agent.Ped.IsDead) continue;
+
+                    BuddyLog.Info("squad: an agent died; respawning that one");
+                    agent.ReplaceDeadPed();
+                }
+            }
+            catch (Exception ex) { BuddyLog.Error("ReplaceDeadAgents failed", ex); }
         }
 
         private void ReportRefusal(string detail, bool transitioned)

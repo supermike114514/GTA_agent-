@@ -13,6 +13,9 @@ namespace GTA5Buddy
 
         // ---- model used when spawning ----
         internal const string DefaultModel = "s_m_m_security_01";
+
+        /// <summary>DefaultModel 的枚举形式，避免每次生成都做字符串到哈希的转换。</summary>
+        internal const PedHash DefaultPedHash = PedHash.Security01SMM;
         internal const float SpawnDistance = 3.0f;
 
         // ---- follow (L2/F1) ----
