@@ -859,6 +859,10 @@ namespace GTA5Buddy
         private int _escortFarSince;
         private int _lastEscortTeleport;
 
+        // 卡住时的处理阶梯（全部用引擎自带的任务，不自己开车）
+        private bool _escortLongRange;     // 已切到 DRIVE_TO_COORD_LONGRANGE
+        private bool _escortClearedOnce;   // 已清空过一次任务让引擎重规划
+
         /// <summary>
         /// 变形金刚模式：保留最初的"直接推"行为。
         ///
@@ -1181,15 +1185,39 @@ namespace GTA5Buddy
                 {
                     if (_escortStallSince == 0) _escortStallSince = Game.GameTime;
 
-                    if (!_escortDirectDrive &&
-                        Game.GameTime - _escortStallSince > 5000)
+                    // ---- 卡住的处理阶梯：**全部用引擎自带的任务/机制** ----------
+                    //
+                    // 用户质疑得对："为什么 AI 失控时要切换自动驾驶，而不是用引擎内的
+                    // 车辆跟随函数和算法？"
+                    //
+                    // 直接驾驶（自己写 ForwardSpeed + Heading）绕过了引擎全部的碰撞规避、
+                    // 路网与物理约束 —— 那正是"车辆堆积成罗汉塔"的根源。
+                    // 所以默认路径不再用它，改成在引擎的任务之间换挡：
+                    //
+                    //   阶梯 1（4 秒）：换成 TASK_VEHICLE_DRIVE_TO_COORD_LONGRANGE
+                    //                   —— 引擎的另一套长距离寻路（专为远距离赶路设计）
+                    //   阶梯 2（10 秒）：清空任务让引擎重新规划
+                    //   再不行：交给引擎的小队传送（SET_PED_CAN_TELEPORT_TO_GROUP_LEADER）
+                    //           和 5 公里硬传送兜底
+                    //
+                    // 直接驾驶只保留给"变形金刚模式"这个特色功能。
+                    int stalledMs = Game.GameTime - _escortStallSince;
+
+                    if (!_escortLongRange && stalledMs > 4000)
                     {
-                        _escortDirectDrive = true;
-                        BuddyLog.Info("escort[" + _squadIndex + "]: AI driving stalled for 5s, " +
-                                      "switching to DIRECT DRIVE (model=" +
+                        _escortLongRange = true;
+                        BuddyLog.Info("escort[" + _squadIndex + "]: stalled 4s, switching to " +
+                                      "DRIVE_TO_COORD_LONGRANGE (model=" +
                                       _escortVehicle.Model.Hash + ", class=" +
                                       _escortVehicle.ClassType + ")");
-                        Notify("~y~队友 " + (_squadIndex + 1) + " 号的车 AI 驾驶失效，已切换直接控制");
+                    }
+
+                    if (_escortLongRange && stalledMs > 10000 && !_escortClearedOnce)
+                    {
+                        _escortClearedOnce = true;
+                        try { Function.Call(Hash.CLEAR_PED_TASKS, _ped); } catch (Exception) { }
+                        BuddyLog.Info("escort[" + _squadIndex + "]: still stalled 10s, " +
+                                      "cleared tasks to let the engine re-plan");
                     }
                 }
                 else
@@ -1197,7 +1225,8 @@ namespace GTA5Buddy
                     _escortStallSince = 0;
                 }
 
-                if (_escortDirectDrive)
+                // 变形金刚模式（特色功能）：唯一的直接驾驶路径，默认关闭
+                if (TransformerMode && _escortDirectDrive)
                 {
                     DirectDriveToward(player, distance);
                     return;
@@ -1208,6 +1237,28 @@ namespace GTA5Buddy
 
                 // 卡住时给它一段观察期再重发，避免频繁重置
                 if (taskPresent && stalled && Game.GameTime < _nextEscortTask) return;
+
+                // ---- 阶梯 1 生效中：用引擎的长距离寻路任务 ----------------------
+                if (_escortLongRange && !_escortVehicle.IsHelicopter && !_escortVehicle.IsPlane)
+                {
+                    _nextEscortTask = Game.GameTime + BuddyConfig.NavmeshReissueMs;
+                    Vector3 lr = player.Position;
+                    Function.Call(Hash.TASK_VEHICLE_DRIVE_TO_COORD_LONGRANGE,
+                                  _ped, _escortVehicle,
+                                  lr.X, lr.Y, lr.Z,
+                                  distance > 200.0f ? 45.0f : 28.0f,
+                                  (int)EscortDrivingFlags,
+                                  distance > 100.0f ? 25.0f : 12.0f);
+
+                    if (Game.GameTime >= _nextEscortDiag)
+                    {
+                        _nextEscortDiag = Game.GameTime + 3000;
+                        BuddyLog.Info("escort[" + _squadIndex + "]: issued LONGRANGE  dist=" +
+                                      distance.ToString("0.0") + " vehSpeed=" +
+                                      _escortVehicle.Speed.ToString("0.0"));
+                    }
+                    return;
+                }
 
                 // ---- 按载具类型选用对应的任务原生 ------------------------------
                 //
@@ -1452,6 +1503,120 @@ namespace GTA5Buddy
             }
             catch (Exception) { }
             return point;
+        }
+
+        /// <summary>
+        /// 找我方当前应该打的敌人。
+        ///
+        /// 优先级：玩家正在交战的敌人 -> 队友自己已锁定的威胁 -> 被攻击我方的敌人。
+        /// 找不到就返回 null。
+        /// </summary>
+        private Ped FindCombatTarget(Ped player)
+        {
+            try
+            {
+                if (player != null && player.Exists() && player.IsInCombat)
+                {
+                    Ped t = FindThreat(player);
+                    if (t != null && t.Exists() && !t.IsDead) return t;
+                }
+            }
+            catch (Exception) { }
+
+            try
+            {
+                if (_threat != null && _threat.Exists() && !_threat.IsDead) return _threat;
+            }
+            catch (Exception) { }
+
+            return null;
+        }
+
+        /// <summary>
+        /// 乘车战斗：任何坐在车里的队友（**驾驶位和乘客位都算**）对敌人还击。
+        ///
+        /// 这是"车队行驶中无法攻击敌人"的修复。之前有两处问题：
+        ///
+        ///   1. KeepPedInVehicle 里设了 SET_BLOCKING_OF_NON_TEMPORARY_EVENTS，
+        ///      那条原生会屏蔽 ped 对"临时事件"（包括被攻击）的反应 —— 队友对警察
+        ///      和攻击者完全视而不见。已移除。
+        ///
+        ///   2. 只有驾驶位跑战斗逻辑，**乘客完全不会还手**。
+        ///      现在乘客用 TASK_DRIVE_BY（引擎自带的探身射击任务）。
+        ///
+        /// 载具类型决定开火方式：
+        ///   * 有车载武器（坦克炮、APC 机枪）-> SET_VEHICLE_SHOOT_AT_TARGET 让炮塔瞄准
+        ///   * 普通载具 -> 驾驶位用 TASK_VEHICLE_SHOOT_AT_PED；
+        ///                乘客用 TASK_DRIVE_BY 探身射击
+        /// </summary>
+        private void UpdateVehicleCombat(Ped player)
+        {
+            if (Game.GameTime < _nextEscortCombat) return;
+            _nextEscortCombat = Game.GameTime + 400;
+
+            try
+            {
+                if (_ped == null || !_ped.Exists() || !_ped.IsInVehicle()) return;
+
+                Ped enemy = FindCombatTarget(player);
+                if (enemy == null)
+                {
+                    _escortEngaging = false;
+                    return;
+                }
+
+                Vehicle car = _ped.CurrentVehicle;
+                if (car == null || !car.Exists()) return;
+
+                // 判断这一位是不是驾驶位
+                Ped driver = null;
+                try { driver = car.Driver; } catch (Exception) { }
+                bool isDriver = driver != null && driver.Exists() && driver == _ped;
+
+                // 车载武器判定（坦克炮、APC 机枪等）
+                bool hasVehicleWeapon = false;
+                try
+                {
+                    var weaponOut = new OutputArgument();
+                    hasVehicleWeapon = Function.Call<bool>(Hash.GET_CURRENT_PED_VEHICLE_WEAPON,
+                                                           _ped, weaponOut);
+                }
+                catch (Exception) { }
+
+                if (isDriver)
+                {
+                    if (hasVehicleWeapon)
+                    {
+                        // 炮塔/车载武器直接瞄准目标
+                        Function.Call(Hash.SET_VEHICLE_SHOOT_AT_TARGET, _ped, enemy, 0f, 0f, 0f);
+                    }
+
+                    // 驾驶位：用车上武器打目标（引擎会处理成驾驶位射击）
+                    Function.Call(Hash.TASK_VEHICLE_SHOOT_AT_PED, _ped, enemy, 1.0f);
+                }
+                else
+                {
+                    // 乘客：探身射击（引擎自带的 drive-by 任务）
+                    //   p3..p5 = 瞄准偏移（0 = 直接瞄目标）
+                    //   p7     = 使用的武器（0 = 当前武器）
+                    //   p8     = true 表示同时自己瞄准
+                    Function.Call(Hash.TASK_DRIVE_BY,
+                                  _ped, enemy,
+                                  0, 0f, 0f, 0f,
+                                  0, true,
+                                  0);
+                }
+
+                if (!_escortEngaging)
+                {
+                    _escortEngaging = true;
+                    BuddyLog.Info("vehicle combat: agent " + _squadIndex +
+                                  (isDriver ? " (driver)" : " (passenger)") +
+                                  " engaging target=" + enemy.Handle +
+                                  " vehicleWeapon=" + hasVehicleWeapon);
+                }
+            }
+            catch (Exception ex) { BuddyLog.Error("UpdateVehicleCombat failed", ex); }
         }
 
         /// <summary>
@@ -1755,6 +1920,52 @@ namespace GTA5Buddy
         /// <summary>由 AgentSquad 指定这一位的皮肤（生成前调用）。</summary>
         internal void SetSpawnModel(PedHash hash) { _spawnModel = hash; }
 
+        /// <summary>这一位的 Ped 是否就是 <paramref name="ped"/>（供小队按驾驶员反查队友）。</summary>
+        internal bool MatchesPed(Ped ped)
+        {
+            try { return _ped != null && _ped.Exists() && ped != null && ped.Exists() && _ped == ped; }
+            catch (Exception) { return false; }
+        }
+
+        /// <summary>
+        /// 把"已经坐在某辆车驾驶位"的队友转入开车跟随模式。
+        ///
+        /// 用于"车队跟随"：队友先按座位坐满车辆（LoadIntoVehicles），
+        /// 然后每辆车的驾驶员用这个方法开始跟住玩家。
+        /// 与 <see cref="OrderVehicleEscort"/> 的区别是后者会**自己生成一辆车**，
+        /// 而这里复用已经生成并坐好的车。
+        /// </summary>
+        internal void ArmEscortForExistingVehicle(Vehicle vehicle)
+        {
+            try
+            {
+                if (!Exists || vehicle == null || !vehicle.Exists()) return;
+
+                _escortVehicle = vehicle;
+                _driveTarget = vehicle;
+                _escortMode = true;
+                _escortPending = false;
+                _nextEscortTask = 0;
+                _escortStallSince = 0;
+                _escortLongRange = false;
+                _escortClearedOnce = false;
+                _escortDirectDrive = false;
+                _lastEscortPos = null;
+
+                _state = BuddyState.InVehicle;
+
+                Function.Call(Hash.SET_DRIVER_ABILITY, _ped, 1.0f);
+                Function.Call(Hash.SET_DRIVER_AGGRESSIVENESS, _ped, 0.5f);
+
+                // 驾驶员要留在驾驶位；乘客由 AgentSquad 的座位强锁维持
+                KeepPedInVehicle();
+
+                BuddyLog.Info("escort[" + _squadIndex + "]: armed on existing vehicle model=" +
+                              vehicle.Model.Hash);
+            }
+            catch (Exception ex) { BuddyLog.Error("ArmEscortForExistingVehicle failed", ex); }
+        }
+
         /// <summary>
         /// 这一位被安排的车（自驾跟随的车，或指定座驾）。
         /// 座位强锁用它来把溜下车的队友塞回去。
@@ -1874,10 +2085,11 @@ namespace GTA5Buddy
         ///
         ///   DontLeaveVehicleIfLeaderNotInVehicle : 队长不在车上时不许下车（关键的一条）
         ///   DontDragMeOutCar / StayInCarOnJack   : 不被拽下车
-        ///   BlockNonTemporaryEvents              : 不让 AI 事件打断已下发的任务
         ///
-        /// BlockNonTemporaryEvents 只在自驾跟随时开，其它状态（步行战斗）要关掉，
-        /// 否则队友不会对战斗做出反应。
+        /// **刻意不设 SET_BLOCKING_OF_NON_TEMPORARY_EVENTS。**
+        /// 之前设了它，结果队友对警察和攻击者完全视而不见 —— 那条原生会屏蔽 ped
+        /// 对"临时事件"（包括被攻击）的反应。让队友留在车里的真正保障是 AgentSquad
+        /// 的座位强锁（每 500ms 把溜下车的人塞回去），不需要牺牲战斗反应能力。
         /// </summary>
         private void KeepPedInVehicle()
         {
@@ -1885,7 +2097,6 @@ namespace GTA5Buddy
             {
                 if (_ped == null || !_ped.Exists()) return;
 
-                Function.Call(Hash.SET_BLOCKING_OF_NON_TEMPORARY_EVENTS, _ped, true);
                 Function.Call(Hash.SET_PED_CAN_BE_DRAGGED_OUT, _ped, false);
                 Function.Call(Hash.SET_PED_STAY_IN_VEHICLE_WHEN_JACKED, _ped, true);
 
@@ -1968,6 +2179,19 @@ namespace GTA5Buddy
                     GuardSurvival(player);
                     UpdateEscortCombat(player);
                     if (ShowHud) _hud.Draw(_ped, "驾驶跟随");
+                    return;
+                }
+
+                // ---- 乘车战斗：乘客也要能还击 ----------------------------------
+                //
+                // 之前只有驾驶位跑 UpdateEscortCombat，**乘客完全不会还手** ——
+                // 所以"全部坐进一辆车"时车里只有司机能开枪。
+                // 这里对任何坐在车里的队友都跑一次乘车战斗，乘客用 TASK_DRIVE_BY 探身射击。
+                if (_ped.IsInVehicle())
+                {
+                    UpdateVehicleCombat(player);
+                    GuardSurvival(player);
+                    if (ShowHud) _hud.Draw(_ped, "乘车");
                     return;
                 }
 

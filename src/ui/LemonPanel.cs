@@ -722,8 +722,17 @@ namespace GTA5Buddy
                 { _squad.ApplyVehicleCosmetics(240, 210, 30, 1, "已改为亮黄"); });
 
             // ---- 队友自己的车：型号可以从整个刷车器里任选 ----
-            AddAction(_vehicles, "队友 · 用「" + _escortLabel + "」开车跟随",
-                      "队友开这辆车跟住你；型号可换",
+            //
+            // 两个模式，因为用途不同：
+            //   车队跟随   —— 队友一起坐满车辆（巴士能坐 10 个），每辆车的驾驶员开
+            //                 用户明确要求这个作为默认
+            //   一人一辆   —— 每个队友各开一辆，队伍排成长串；人少时更灵活
+            AddAction(_vehicles, "队友 · 车队跟随（全部坐进「" + _escortLabel + "」）",
+                      "队友一起坐满车辆，每辆车的驾驶员开车跟住你",
+                      delegate { _squad.OrderVehicleEscortFilled(_escortModel); });
+
+            AddAction(_vehicles, "队友 · 一人一辆开车跟随（「" + _escortLabel + "」）",
+                      "每个队友各开一辆车，队伍会排成长串",
                       delegate { _squad.OrderVehicleEscortAll(_escortModel); });
 
             var pickEscort = new NativeItem("队友 · 选择跟随用载具    >",

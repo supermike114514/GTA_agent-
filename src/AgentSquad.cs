@@ -543,10 +543,61 @@ namespace GTA5Buddy
             ForEach(a => a.ApplyVehicleCosmetics(r, g, b, tint, label));
         }
 
-        /// <summary>让全部队友各自生成一辆车并开车跟随。</summary>
+        /// <summary>让全部队友各自生成一辆车并开车跟随（一人一辆）。</summary>
         internal void OrderVehicleEscortAll(VehicleHash model)
         {
             ForEach(a => a.OrderVehicleEscort(model));
+        }
+
+        /// <summary>
+        /// 车队跟随：队友**一起坐进车辆**（每辆坐满再开下一辆），由每辆车的驾驶员开车跟随。
+        ///
+        /// 与 <see cref="OrderVehicleEscortAll"/> 的区别：
+        ///   前者一人一辆车（N 个队友 = N 辆车），人多时路上会排一长串；
+        ///   这个是**坐满一辆再开下一辆**，4 个人可能只占 1 辆车（巴士能坐 10 个）。
+        ///
+        /// 用户明确要求"用车辆跟随时队友也是全部坐进车辆里面，而不是一人一辆"，
+        /// 所以面板上的"开车跟随"走这条路径。
+        ///
+        /// 实现复用 LoadIntoVehicles 的生成与座位分配，再把每辆车的驾驶员转入 escort 模式 ——
+        /// 座位分配只保留一份实现，不会两边不一致。
+        /// </summary>
+        internal void OrderVehicleEscortFilled(VehicleHash model)
+        {
+            try
+            {
+                // 1. 生成车辆并把队友坐满（复用既有逻辑）
+                LoadIntoVehicles(model);
+
+                // 2. 每辆车的驾驶员转入 escort 模式：由他开车跟住玩家
+                int armed = 0;
+                foreach (Vehicle v in _squadVehicles.ToArray())
+                {
+                    if (v == null || !v.Exists()) continue;
+
+                    Ped driver = null;
+                    try { driver = v.Driver; } catch (Exception) { }
+                    if (driver == null || !driver.Exists()) continue;
+
+                    foreach (Companion a in _agents.ToArray())
+                    {
+                        if (!a.Exists) continue;
+                        if (!a.MatchesPed(driver)) continue;
+
+                        a.ArmEscortForExistingVehicle(v);
+                        armed++;
+                        break;
+                    }
+                }
+
+                BuddyLog.Info("squad: filled convoy armed " + armed +
+                              " drivers across " + _squadVehicles.Count + " vehicles");
+
+                Notify(armed > 0
+                    ? "~g~车队已就位：" + armed + " 辆车跟着你"
+                    : "~y~没有可用的驾驶员，队友可能没上车");
+            }
+            catch (Exception ex) { BuddyLog.Error("OrderVehicleEscortFilled failed", ex); }
         }
 
         internal void StopVehicleEscortAll()
