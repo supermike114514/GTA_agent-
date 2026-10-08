@@ -867,6 +867,10 @@ namespace GTA5Buddy
         // 用它判断"意图有没有变" —— 任务类型是持续型的，意图不变就不该重发。
         private int _currentMission = -1;
 
+        // 队友组当前是否与警察敌对（跟随玩家的通缉等级）
+        private bool _copHostile;
+        private int _nextRelationSync;   // 关系表同步节流
+
         /// <summary>
         /// 变形金刚模式：保留最初的"直接推"行为。
         ///
@@ -1323,6 +1327,14 @@ namespace GTA5Buddy
                 // ---- 决定当前该用哪种任务类型 ----
                 //
                 // 战意优先：附近有敌人就切到 Attack（引擎的攻击任务会主动逼近并交战）。
+                // 每次检查前先刷新关系表：不刷新的话队友对警察/帮派是"中立"，
+                // 永远不会还击（这是"车内不攻击"的根本原因）。
+                EnsureRelationshipGroups(player);
+                if (Game.GameTime >= _nextRelationSync)
+                {
+                    _nextRelationSync = Game.GameTime + 2000;
+                    MirrorPlayerRelationships(player);
+                }
                 Ped enemy = FindCombatTarget(player);
 
                 Vehicle playerCar = null;
@@ -1724,6 +1736,14 @@ namespace GTA5Buddy
             {
                 if (_ped == null || !_ped.Exists() || !_ped.IsInVehicle()) return;
 
+                // 每次检查前先刷新关系表：不刷新的话队友对警察/帮派是"中立"，
+                // 永远不会还击（这是"车内不攻击"的根本原因）。
+                EnsureRelationshipGroups(player);
+                if (Game.GameTime >= _nextRelationSync)
+                {
+                    _nextRelationSync = Game.GameTime + 2000;
+                    MirrorPlayerRelationships(player);
+                }
                 Ped enemy = FindCombatTarget(player);
                 if (enemy == null)
                 {
@@ -1811,6 +1831,14 @@ namespace GTA5Buddy
 
                 // 用统一的查找（含**主动扫描**）—— 原来只看 player.IsInCombat 和 _threat，
                 // 而 escort 模式下 _threat 永远是 null，所以战斗从未触发。
+                // 每次检查前先刷新关系表：不刷新的话队友对警察/帮派是"中立"，
+                // 永远不会还击（这是"车内不攻击"的根本原因）。
+                EnsureRelationshipGroups(player);
+                if (Game.GameTime >= _nextRelationSync)
+                {
+                    _nextRelationSync = Game.GameTime + 2000;
+                    MirrorPlayerRelationships(player);
+                }
                 Ped enemy = FindCombatTarget(player);
 
                 if (enemy == null || !enemy.Exists() || enemy.IsDead)
@@ -2035,6 +2063,77 @@ namespace GTA5Buddy
             {
                 _groupCreated = false;
             }
+        }
+
+        /// <summary>
+        /// 把**玩家的关系**镜像到本队友的关系组上，并让警察的敌意跟随通缉等级。
+        ///
+        /// 这是"队友不还击"的根本修复。
+        ///
+        /// 原来的关系表只有两条：队友组之间 BUDDY、队友组对玩家组 RESPECT。
+        /// 对警察、帮派、雇佣兵**完全没有定义** —— 没定义在 GTA 里就是**中立**。
+        /// 所以玩家被警察围攻时，队友眼里的警察是中立目标，**永远不开火**；
+        /// 这跟武器、战斗属性、驾驶任务都无关，是关系表里根本没写。
+        ///
+        /// 两步处理：
+        ///   1. 把玩家对各常见敌对组的关系原样抄给队友组（双向）。
+        ///      玩家和某帮派打起来时游戏会把它设为仇恨玩家，镜像后队友也会一起打。
+        ///   2. 警察单独处理：它的敌意由**通缉等级**驱动（PLAYER 组对 COP 的静态
+        ///      关系一直是友好的），所以按 wantedLevel 显式设置：
+        ///      被通缉 -> 队友组与 COP 互相仇恨；通缉解除 -> 恢复中立。
+        ///
+        /// 幂等方法，可以反复调用（关系会随剧情和通缉变化）。
+        /// </summary>
+        private void MirrorPlayerRelationships(Ped player)
+        {
+            try
+            {
+                if (_group.Hash == 0) return;
+
+                Hash mine = (Hash)(uint)_group.Hash;
+
+                // ---- 1. 镜像玩家的关系 ----
+                Hash playerGroup = (Hash)(uint)player.RelationshipGroup.Hash;
+                if (playerGroup != 0)
+                {
+                    foreach (string name in BuddyConfig.MirroredRelationGroups)
+                    {
+                        try
+                        {
+                            Hash other = Function.Call<Hash>(Hash.GET_HASH_KEY, name);
+                            if (other == 0) continue;
+
+                            int rel = Function.Call<int>(Hash.GET_RELATIONSHIP_BETWEEN_GROUPS,
+                                                         playerGroup, other);
+
+                            // 双向设置
+                            Function.Call(Hash.SET_RELATIONSHIP_BETWEEN_GROUPS, rel, mine, other);
+                            Function.Call(Hash.SET_RELATIONSHIP_BETWEEN_GROUPS, rel, other, mine);
+                        }
+                        catch (Exception) { }
+                    }
+                }
+
+                // ---- 2. 警察：跟随通缉等级 ----
+                Hash cop = Function.Call<Hash>(Hash.GET_HASH_KEY, BuddyConfig.CopRelationshipGroup);
+                if (cop != 0)
+                {
+                    bool wanted = false;
+                    try { wanted = Game.Player.Wanted.WantedLevel > 0; } catch (Exception) { }
+
+                    int rel = wanted ? 5 /* Hate */ : 3 /* Neutral */;
+                    Function.Call(Hash.SET_RELATIONSHIP_BETWEEN_GROUPS, rel, mine, cop);
+                    Function.Call(Hash.SET_RELATIONSHIP_BETWEEN_GROUPS, rel, cop, mine);
+
+                    if (wanted != _copHostile)
+                    {
+                        _copHostile = wanted;
+                        BuddyLog.Info("escort[" + _squadIndex + "]: police relationship -> " +
+                                      (wanted ? "HOSTILE (player wanted)" : "neutral"));
+                    }
+                }
+            }
+            catch (Exception ex) { BuddyLog.Error("MirrorPlayerRelationships failed", ex); }
         }
 
         /// <summary>

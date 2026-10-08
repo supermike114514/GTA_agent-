@@ -101,6 +101,46 @@ namespace GTA5Buddy
         /// </summary>
         internal const float VehicleCombatScanRadius = 70.0f;
 
+        /// <summary>
+        /// 需要把**玩家的关系**镜像到队友组上的关系组名。
+        ///
+        /// 为什么必须做这件事：
+        ///   队友本来只有两种关系定义 —— 队友组之间 BUDDY、队友组对玩家组 RESPECT。
+        ///   对警察、帮派、雇佣兵等**完全没有定义**，而没定义在 GTA 里就是**中立**。
+        ///   于是玩家被警察围攻时，队友看到的警察是"中立"的，**根本不会还击** ——
+        ///   换武器、开战斗属性、下攻击任务都救不了，因为关系表里就没写。
+        ///
+        /// 做法是把玩家对这些组的当前关系**原样抄到队友组上**：
+        /// 玩家和某个帮派打起来了，游戏会把该帮派设为仇恨玩家，
+        /// 镜像之后队友也就仇恨该帮派，于是会一起开火。
+        /// </summary>
+        internal static readonly string[] MirroredRelationGroups = new string[]
+        {
+            "AMBIENT_GANG_LOST",
+            "AMBIENT_GANG_MEXICAN",
+            "AMBIENT_GANG_FAMILY",
+            "AMBIENT_GANG_BALLAS",
+            "AMBIENT_GANG_SALVA",
+            "AMBIENT_GANG_WEICHENG",
+            "AMBIENT_GANG_HILLBILLY",
+            "AMBIENT_GANG_VAGOS",
+            "GANG_1", "GANG_2", "GANG_3", "GANG_4", "GANG_5",
+            "GANG_6", "GANG_7", "GANG_8", "GANG_9", "GANG_10",
+            "MERRYWEATHER",
+            "SECURITY",
+            "ARMY",
+            "PRIVATE_SECURITY",
+            "HATES_PLAYER",
+            "FIREMAN",
+            "MEDIC",
+        };
+
+        /// <summary>
+        /// 警察关系组的名字。单独处理，因为警察的敌意由**通缉等级**驱动，
+        /// 而不是由 PLAYER 关系组的静态关系决定。
+        /// </summary>
+        internal const string CopRelationshipGroup = "COP";
+
         // ---- follow (L2/F1) ----
         internal const float FollowOffsetSide = 1.2f;   // + = to the buddy's right of the player
         internal const float FollowOffsetBack = -1.1f;  // - = behind the player
