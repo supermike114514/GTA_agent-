@@ -88,15 +88,35 @@ namespace GTA5Buddy
                 int seat = -1;
                 int maxSeat = 0;
                 int loaded = 0;
+                int carsMade = 0;
 
-                foreach (Companion agent in _agents.ToArray())
+                // 用 while + 手工推进下标，而不是 foreach。
+                //
+                // 原实现是 foreach + `if (座位满了) { car = null; continue; }`，那个 continue
+                // 会跳到**下一个队友**，于是当前这个队友被整个跳过、永远没有座位。
+                // 实测 35 个队友只坐上了 7 个就是这个原因。
+                // 正确做法是：车满了就只换车，**不推进队友下标**，让同一个队友重试。
+                Companion[] agents = _agents.ToArray();
+                int idx = 0;
+
+                while (idx < agents.Length)
                 {
-                    if (!agent.Exists) continue;
+                    Companion agent = agents[idx];
+                    if (!agent.Exists) { idx++; continue; }
 
-                    // 需要一辆新车：当前车不存在，或座位已坐满
+                    // 需要一辆新车：还没有车，或当前车座位已满
                     if (car == null || seat > maxSeat)
                     {
-                        Vector3 pos = player.Position + player.ForwardVector * (8.0f + (loaded * 1.2f));
+                        // 车距不要随数量线性外推，否则 30 个队友会在前方排出近百米。
+                        // 按 6 个一组循环使用位置，整体控制在一个紧凑的范围内。
+                        int slot = carsMade % 6;
+                        float side = ((slot % 3) - 1) * 5.0f;
+                        float back = 8.0f + ((slot / 3) * 6.0f);
+
+                        Vector3 pos = player.Position
+                                    + player.ForwardVector * back
+                                    + player.RightVector * side;
+
                         float groundZ;
                         if (World.GetGroundHeight(pos, out groundZ))
                             pos = new Vector3(pos.X, pos.Y, groundZ + 0.5f);
@@ -104,15 +124,16 @@ namespace GTA5Buddy
                         car = World.CreateVehicle(carModel, pos, player.Heading);
                         if (car == null || !car.Exists())
                         {
-                            Notify("~r~生成载具失败");
+                            Notify("~r~生成载具失败，已安排 " + loaded + " 个队友");
                             return;
                         }
 
                         car.IsPersistent = true;
                         car.PlaceOnGround();
                         car.IsEngineRunning = true;
+                        carsMade++;
 
-                        // 座位总数含驾驶位：PassengerCapacity 不含驾驶员，所以 +1
+                        // 座位总数含驾驶位：PassengerCapacity 不含驾驶员
                         maxSeat = Function.Call<int>(Hash.GET_VEHICLE_MAX_NUMBER_OF_PASSENGERS, car);
                         seat = -1;
                         Script.Wait(0);
@@ -123,7 +144,7 @@ namespace GTA5Buddy
 
                     if (seat > maxSeat)
                     {
-                        // 这辆车满了：下一轮循环开新车，并重试同一个队友
+                        // 这辆车满了：换车，但**不推进 idx**，下一个循环让同一个队友重试
                         car = null;
                         continue;
                     }
@@ -131,10 +152,13 @@ namespace GTA5Buddy
                     agent.WarpIntoVehicle(car, (VehicleSeat)seat);
                     seat++;
                     loaded++;
+                    idx++;
                 }
 
-                Notify("~g~已安排 " + loaded + " 个队友上车（尽量坐满每辆车）");
-                BuddyLog.Info("squad: loaded " + loaded + " agents into vehicles, model=" + model);
+                Notify("~g~已安排 " + loaded + "/" + agents.Length + " 个队友上车，用了 " +
+                       carsMade + " 辆车（尽量坐满每辆）");
+                BuddyLog.Info("squad: loaded " + loaded + "/" + agents.Length +
+                              " agents into " + carsMade + " vehicles, model=" + model);
             }
             catch (Exception ex) { BuddyLog.Error("LoadIntoVehicles failed", ex); }
         }

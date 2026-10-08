@@ -303,7 +303,17 @@ namespace GTA5Buddy
         private static void AddAction(NativeMenu menu, string title, string description, Action action)
         {
             var item = new NativeItem(title, description);
-            item.Activated += delegate { try { action(); } catch (Exception) { } };
+            item.Activated += delegate
+            {
+                // 不要把异常吞掉：以前这里是空的 catch，动作一旦抛异常就表现为
+                // "点了没反应"，既看不到提示也查不到日志 —— 定位问题时非常致命。
+                try { action(); }
+                catch (Exception ex)
+                {
+                    BuddyLog.Error("menu action failed: " + title, ex);
+                    Notify("~r~执行失败：" + ex.Message);
+                }
+            };
             menu.Add(item);
         }
 

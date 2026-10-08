@@ -50,7 +50,36 @@ namespace GTA5Buddy
 
             var dirs = new List<string>();
 
-            // 1. the game root: parent of scripts\, proven writable by SHV/SHVDN's own logs
+            // 1. 桌面优先。
+            //
+            // 这一点是踩过坑才定下来的：SHVDN 会把 scripts\ 里的程序集**影子复制**到
+            // %LOCALAPPDATA%\assembly\dl3\... 再加载，于是 Assembly.Location 指向那个
+            // 缓存目录，它的父目录恰好可写 —— 结果日志被写进了
+            //   ...\assembly\dl3\<乱码>\<乱码>\GTA5Buddy.log
+            // 一个谁也找不到的深层路径（实测那里躺了 220 KB 的诊断日志）。
+            // 桌面是用户一定能找到的位置，所以放在第一位。
+            try
+            {
+                string profile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+                if (!string.IsNullOrEmpty(profile))
+                {
+                    dirs.Add(System.IO.Path.Combine(profile, "Desktop"));
+                    dirs.Add(System.IO.Path.Combine(profile, "Documents"));
+                }
+            }
+            catch (Exception) { }
+
+            // 2. 游戏根目录：影子复制之后 assemblyDir 已经不是 scripts\ 了，
+            //    所以这里单独尝试从进程路径推一次游戏目录，方便就地排查。
+            try
+            {
+                string exe = System.Diagnostics.Process.GetCurrentProcess().MainModule.FileName;
+                string gameDir = System.IO.Path.GetDirectoryName(exe);
+                if (!string.IsNullOrEmpty(gameDir)) dirs.Add(gameDir);
+            }
+            catch (Exception) { }
+
+            // 3. the game root: parent of scripts\, proven writable by SHV/SHVDN's own logs
             try
             {
                 DirectoryInfo parent = new DirectoryInfo(assemblyDir).Parent;
@@ -58,10 +87,10 @@ namespace GTA5Buddy
             }
             catch (Exception) { }
 
-            // 2. next to the assembly (classic SHVDN convention)
+            // 4. next to the assembly (classic SHVDN convention)
             dirs.Add(assemblyDir);
 
-            // 3. the user profile: Desktop / Documents / UserProfile. In practice the game
+            // 5. the user profile: Desktop / Documents / UserProfile. In practice the game
             //    folder and the scripts folder both turned out to be unwritable for the game
             //    process, which left the mod completely silent; a profile path is the last
             //    place that is reliably writable, so the diagnostics stay readable.

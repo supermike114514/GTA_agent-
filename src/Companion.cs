@@ -825,6 +825,7 @@ namespace GTA5Buddy
         private bool _escortPending;
         private Model _escortModel;
         private int _escortRequestedAt;
+        private int _nextEscortDiag;   // 诊断日志节流
 
         /// <summary>True while the companion is driving its own car to keep up with the player.</summary>
         internal bool EscortMode { get { return _escortMode; } }
@@ -896,11 +897,13 @@ namespace GTA5Buddy
 
                 _escortPending = false;
 
-                // 每个队友的车在**不同位置**生成。原来所有队友都用 player+前向*8，
-                // 几辆车生成在同一点会互相顶住，结果只有一辆能开出去。
-                int slot = _squadIndex;
-                float side = ((slot % 3) - 1) * 4.5f;            // -4.5 / 0 / +4.5 三列
-                float back = 8.0f + ((slot / 3) * 5.5f);         // 每三辆往后错一排
+                // 每个队友的车在**不同位置**生成，但间距不能随编号线性外推：
+                // 原来 back = 8 + (index/3)*5.5，第 30 个队友的车会生成在 60 米开外，
+                // 整队排成近百米长的一列，看起来完全不像"跟随"。
+                // 改成 6 个位置循环使用，整体控制在一个紧凑的范围内。
+                int slot = _squadIndex % 6;
+                float side = ((slot % 3) - 1) * 5.0f;            // -5 / 0 / +5 三列
+                float back = 8.0f + ((slot / 3) * 6.0f);         // 两排：8m / 14m
 
                 Vector3 pos = player.Position
                             + player.ForwardVector * back
@@ -995,6 +998,20 @@ namespace GTA5Buddy
 
             try
             {
+                // 诊断：定期把 escort 的关键状态写进日志。
+                // 这个功能反复出问题却看不到内部状态，所以留一条明确的观测线。
+                if (Game.GameTime >= _nextEscortDiag)
+                {
+                    _nextEscortDiag = Game.GameTime + 2000;
+                    bool inVeh = _ped != null && _ped.Exists() && _ped.IsInVehicle();
+                    bool inMyCar = inVeh && _ped.CurrentVehicle == _escortVehicle;
+                    BuddyLog.Info("escort[" + _squadIndex + "] pending=" + _escortPending +
+                                  " escortVeh=" + (_escortVehicle != null && _escortVehicle.Exists()) +
+                                  " pedInVeh=" + inVeh + " inMyCar=" + inMyCar +
+                                  " speed=" + (_escortVehicle != null && _escortVehicle.Exists()
+                                               ? _escortVehicle.Speed.ToString("0.0") : "n/a"));
+                }
+
                 // 先处理"座驾还没生成"的状态：模型加载完才创建车辆
                 if (_escortPending)
                 {
@@ -1015,10 +1032,15 @@ namespace GTA5Buddy
                 // Make sure the buddy is actually behind the wheel; it can be dragged out.
                 if (!_ped.IsInVehicle() || _ped.CurrentVehicle != _escortVehicle)
                 {
-                    if (Game.GameTime - _enterVehicleIssuedAt > 3000)
+                    if (Game.GameTime - _enterVehicleIssuedAt > 2000)
                     {
                         _enterVehicleIssuedAt = Game.GameTime;
-                        _ped.Task.WarpIntoVehicle(_escortVehicle, VehicleSeat.Driver);
+
+                        // 直接用 SET_PED_INTO_VEHICLE：这是即时生效的放置，
+                        // 比给一个 Task 更可靠（Task 可能被其它任务排队挡住）。
+                        Function.Call(Hash.SET_PED_INTO_VEHICLE, _ped, _escortVehicle, (int)VehicleSeat.Driver);
+
+                        BuddyLog.Info("escort[" + _squadIndex + "]: re-seated driver by native call");
                     }
                     return;
                 }
@@ -1031,7 +1053,7 @@ namespace GTA5Buddy
                 bool stuck = _escortVehicle.Speed < 1.0f && distance > 12.0f;
 
                 if (!farBehind && !stuck && Game.GameTime < _nextEscortTask) return;
-                _nextEscortTask = Game.GameTime + (stuck ? 1000 : 2500);
+                _nextEscortTask = Game.GameTime + (stuck ? 1200 : 2500);
 
                 // 落后越远开得越快，避免永远追不上
                 float cruise = farBehind ? 35.0f : (_squadIndex == 0 ? 22.0f : 19.0f);
@@ -1040,6 +1062,11 @@ namespace GTA5Buddy
                 int followDistance = 8 + (_squadIndex * 3);
 
                 _ped.Task.VehicleFollow(_escortVehicle, player, cruise, EscortDrivingFlags, followDistance);
+
+                BuddyLog.Info("escort[" + _squadIndex + "]: issued follow task  dist=" +
+                              distance.ToString("0.0") + " speed=" + cruise.ToString("0.0") +
+                              " followDist=" + followDistance + " farBehind=" + farBehind +
+                              " stuck=" + stuck);
             }
             catch (Exception ex) { BuddyLog.Error("UpdateVehicleEscort failed", ex); }
         }
@@ -1160,8 +1187,30 @@ namespace GTA5Buddy
             try
             {
                 if (!Exists || vehicle == null || !vehicle.Exists()) return;
+
                 Function.Call(Hash.SET_PED_INTO_VEHICLE, _ped, vehicle, (int)seat);
                 _state = BuddyState.InVehicle;
+
+                // 关键：告诉状态机"我这辆车就是安排给我的那辆"。
+                //
+                // 原来这里只设置了 _escortVehicle，而状态机的 UpdateVehicle 读的是
+                // _driveTarget —— 它不知道我们给了队友一辆车，于是会去找/偷别的车，
+                // 表现就是"坐进同一辆载具的队友不跟随"。
+                _driveTarget = vehicle;
+
+                // 坐驾驶位的人由 escort 逻辑接管驾驶；乘客只要留在车上即可。
+                if (seat == VehicleSeat.Driver)
+                {
+                    _escortVehicle = vehicle;
+                    _escortMode = true;
+                    _escortPending = false;
+                    _nextEscortTask = 0;
+                    Function.Call(Hash.SET_DRIVER_ABILITY, _ped, 1.0f);
+                    Function.Call(Hash.SET_DRIVER_AGGRESSIVENESS, _ped, 0.5f);
+                }
+
+                BuddyLog.Info("vehicle: agent " + _squadIndex + " -> seat " + (int)seat +
+                              (seat == VehicleSeat.Driver ? " (driver, escort armed)" : " (passenger)"));
             }
             catch (Exception ex) { BuddyLog.Error("WarpIntoVehicle failed", ex); }
         }
