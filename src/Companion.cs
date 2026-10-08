@@ -1049,52 +1049,81 @@ namespace GTA5Buddy
                 }
 
                 float distance = _escortVehicle.Position.DistanceTo(player.Position);
-                bool farBehind = distance > 45.0f;
 
-                // 距离很远，或车几乎停住（可能卡在路口/障碍）时立刻重发任务；
-                // 否则按计时器保持。每帧重发会让车抽搐，完全不重发则会停在原地。
-                bool stuck = _escortVehicle.Speed < 1.0f && distance > 12.0f;
-
-                if (!farBehind && !stuck && Game.GameTime < _nextEscortTask) return;
-                _nextEscortTask = Game.GameTime + (stuck ? 1200 : 2200);
-
-                // 落后越远开得越快，避免永远追不上
-                float cruise = farBehind ? 35.0f : (_squadIndex == 0 ? 22.0f : 19.0f);
-                float stopRange = farBehind ? 18.0f : 12.0f;
-
-                // 目标点：玩家当前位置。刻意不再用"梯队偏移位"：
-                // 偏移位在玩家移动时会落在路边/建筑上，寻路会失败导致车不动。
-                Vector3 dest = player.Position;
-
-                // 用 TASK_VEHICLE_DRIVE_TO_COORD 而不是 VehicleFollow：
-                // 这个原生的每个参数我都能显式控制，便于按日志逐步收敛。
+                // ---- 任务是否仍在运行 ----------------------------------------
                 //
-                // 参数顺序（alloc8or 参考）：
-                //   ped, vehicle, x, y, z, speed, p6, vehicleModel, drivingMode, stopRange, p10
-                // p6 与 p10 按惯例都传 1.0。**之前我把 p6 传成 0**，
-                // 那会让任务无法正常建立 —— 很可能就是最初"车完全不动"的原因。
-                Function.Call(Hash.TASK_VEHICLE_DRIVE_TO_COORD,
-                              _ped, _escortVehicle,
-                              dest.X, dest.Y, dest.Z,
-                              cruise,
-                              1.0f,
-                              _escortVehicle.Model.Hash,
-                              (int)EscortDrivingFlags,
-                              stopRange,
-                              1.0f);
+                // 这是本功能之前一直失败的核心原因：
+                //
+                //   TASK_* 原生是**替换型**的 —— 调用它会替换掉 ped 当前的脚本任务。
+                //   我原来每隔 1.2~2.2 秒无条件重发一次驾驶任务，等于不断地把车
+                //   "刚开始执行的路线规划"重置掉，车永远跑不过两秒就被打断，
+                //   表现就是停在原地。
+                //
+                // 正确做法：持续型任务只需下发一次，之后由引擎自己维持跟随关系；
+                // 只有任务确实结束了才需要重新下发。
+                ScriptTaskStatus status = _ped.CurrentScriptTaskStatus;
+                bool taskRunning = status == ScriptTaskStatus.Performing ||
+                                   status == ScriptTaskStatus.WaitingToStart;
 
-                // 位置追踪：下一次重发时能算出车实际移动了多远。
-                // 这样日志可以直接回答"车到底动没动"，不用再靠猜。
+                // 位移追踪：用来判断"任务在跑但车没动"（卡住）这种例外情况。
                 Vector3 now = _escortVehicle.Position;
                 float moved = _lastEscortPos.HasValue ? now.DistanceTo(_lastEscortPos.Value) : 0f;
                 _lastEscortPos = now;
 
-                BuddyLog.Info("escort[" + _squadIndex + "]: task issued  dist=" +
-                              distance.ToString("0.0") + " speed=" + cruise.ToString("0.0") +
-                              " stopRange=" + stopRange.ToString("0.0") +
+                bool stalled = _escortVehicle.Speed < 1.0f && distance > 15.0f;
+
+                // 任务在正常跑、而且车没卡住 —— 什么都不要做，别去打断它
+                if (taskRunning && !stalled) return;
+
+                // 卡住时给它一段观察期再重发，避免频繁重置
+                if (taskRunning && stalled && Game.GameTime < _nextEscortTask) return;
+
+                _nextEscortTask = Game.GameTime + (taskRunning ? 4000 : 0);
+
+                float cruise = distance > 45.0f ? 35.0f : (_squadIndex == 0 ? 22.0f : 19.0f);
+                string kind;
+
+                if (player.IsInVehicle() && player.CurrentVehicle != null && player.CurrentVehicle.Exists())
+                {
+                    // ---- 玩家在车上：用 escort（持续型，引擎自己维持编队）----
+                    //
+                    // p3 = mode：Rear(-1) 表示跟在目标车后方
+                    // p7 = -1（惯例值）
+                    // noRoadsDistance：离道路多远之内允许脱离路网，给大一点避免卡住
+                    Function.Call(Hash.TASK_VEHICLE_ESCORT,
+                                  _ped, _escortVehicle, player.CurrentVehicle,
+                                  (int)VehicleEscortType.Rear,
+                                  cruise,
+                                  (int)EscortDrivingFlags,
+                                  15.0f,      // minDistance：保持的最小间距
+                                  -1,
+                                  30.0f);     // noRoadsDistance
+                    kind = "ESCORT(rear)";
+                }
+                else
+                {
+                    // ---- 玩家步行：用 ped-target 的 Follow 任务（同样是持续型）----
+                    //
+                    // p6 = targetReachedDist：到这个距离就算"跟上"，车会停
+                    // p7 = straightLineDist：**不能设 0**，设 0 会让车试图直线冲向目标
+                    //      （撞墙、抄野地）；给 10 米表示"最后 10 米才走直线"
+                    Function.Call(Hash.TASK_VEHICLE_MISSION_PED_TARGET,
+                                  _ped, _escortVehicle, player,
+                                  7,          // VehicleMissionType.Follow
+                                  cruise,
+                                  (int)EscortDrivingFlags,
+                                  14.0f,      // targetReachedDist
+                                  10.0f,      // straightLineDist
+                                  false);     // driveAgainstTraffic
+                    kind = "FOLLOW(ped)";
+                }
+
+                BuddyLog.Info("escort[" + _squadIndex + "]: issued " + kind +
+                              "  wasRunning=" + taskRunning + " status=" + status +
+                              " dist=" + distance.ToString("0.0") +
+                              " cruise=" + cruise.ToString("0.0") +
                               " vehSpeed=" + _escortVehicle.Speed.ToString("0.0") +
-                              " movedSince=" + moved.ToString("0.0") +
-                              " farBehind=" + farBehind + " stuck=" + stuck);
+                              " moved=" + moved.ToString("0.0"));
             }
             catch (Exception ex) { BuddyLog.Error("UpdateVehicleEscort failed", ex); }
         }
