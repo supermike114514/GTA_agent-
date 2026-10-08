@@ -924,7 +924,18 @@ namespace GTA5Buddy
                 }
 
                 car.IsPersistent = true;
-                car.PlaceOnGround();
+
+                // 飞行器留出高度：贴地生成会让直升机/固定翼卡在地形里起不来。
+                // 地面载具照旧贴地。
+                if (car.IsAircraft)
+                {
+                    car.Position = new Vector3(pos.X, pos.Y, pos.Z + 12.0f);
+                }
+                else
+                {
+                    car.PlaceOnGround();
+                }
+
                 car.IsEngineRunning = true;
 
                 _ped.Task.WarpIntoVehicle(car, VehicleSeat.Driver);
@@ -1083,9 +1094,36 @@ namespace GTA5Buddy
                 float cruise = distance > 45.0f ? 35.0f : (_squadIndex == 0 ? 22.0f : 19.0f);
                 string kind;
 
-                if (player.IsInVehicle() && player.CurrentVehicle != null && player.CurrentVehicle.Exists())
+                // ---- 按载具类型选用对应的任务原生 ------------------------------
+                //
+                // 这是"为什么别人的修改器连直升机、摩托车都能跟随"的答案：
+                // 地面车的驾驶任务对飞行器**完全无效**，必须用专门的任务。
+                //
+                //   直升机   -> TASK_HELI_CHASE    （持续型追击，带偏移）
+                //   固定翼   -> TASK_PLANE_CHASE
+                //   地面载具 -> 玩家在车上 ESCORT / 玩家步行 FOLLOW(ped)
+                //
+                // 三者都是持续型任务：下发一次，由引擎自己维持追击关系。
+                if (_escortVehicle.IsHelicopter)
                 {
-                    // ---- 玩家在车上：用 escort（持续型，引擎自己维持编队）----
+                    // 偏移：略靠后上方，避免撞到玩家
+                    Function.Call(Hash.TASK_HELI_CHASE,
+                                  _ped,
+                                  player,
+                                  0.0f, -18.0f, 12.0f);
+                    kind = "HELI_CHASE";
+                }
+                else if (_escortVehicle.IsPlane)
+                {
+                    Function.Call(Hash.TASK_PLANE_CHASE,
+                                  _ped,
+                                  player,
+                                  0.0f, -40.0f, 25.0f);
+                    kind = "PLANE_CHASE";
+                }
+                else if (player.IsInVehicle() && player.CurrentVehicle != null && player.CurrentVehicle.Exists())
+                {
+                    // ---- 玩家在车上：escort（持续型，引擎自己维持编队）----
                     //
                     // p3 = mode：Rear(-1) 表示跟在目标车后方
                     // p7 = -1（惯例值）
@@ -1102,7 +1140,7 @@ namespace GTA5Buddy
                 }
                 else
                 {
-                    // ---- 玩家步行：用 ped-target 的 Follow 任务（同样是持续型）----
+                    // ---- 玩家步行：ped-target 的 Follow 任务（同样是持续型）----
                     //
                     // p6 = targetReachedDist：到这个距离就算"跟上"，车会停
                     // p7 = straightLineDist：**不能设 0**，设 0 会让车试图直线冲向目标
