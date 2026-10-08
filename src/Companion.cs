@@ -855,6 +855,10 @@ namespace GTA5Buddy
         private bool _escortDirectDrive;
         private int _escortStallSince;
 
+        // 传送防抖：距离超阈值后的起始时间、上次传送时间
+        private int _escortFarSince;
+        private int _lastEscortTeleport;
+
         /// <summary>
         /// 变形金刚模式：保留最初的"直接推"行为。
         ///
@@ -1138,11 +1142,32 @@ namespace GTA5Buddy
                 //
                 // 用户明确要求的兜底，也是最有保证的做法：与其让 AI 或直接控制在几十米外
                 // 挣扎（还会互相堆积），不如超过阈值就干脆把人车一起挪到玩家附近的路面上。
-                // 阈值给得较大，正常跟得上时不会触发。
+                //
+                // 两个防抖条件，解决"一直在不断传送"：
+                //   1. 超出阈值后还要**持续 3 秒**才真的传送（玩家高速掠过不误触发）
+                //   2. 传送后**冷却 12 秒**，让驾驶 AI 有机会自己追上
+                //      没有冷却的话，传送后玩家仍在移动，距离很快又超阈值，
+                //      就会反复传送 —— 表现就是队友在你身边闪来闪去。
                 if (distance > BuddyConfig.EscortTeleportBeyond)
                 {
-                    TeleportEscortNear(player, distance);
-                    return;
+                    if (_escortFarSince == 0) _escortFarSince = Game.GameTime;
+
+                    bool cooledDown = Game.GameTime - _lastEscortTeleport >=
+                                      BuddyConfig.EscortTeleportCooldownMs;
+                    bool sustained = Game.GameTime - _escortFarSince >=
+                                     BuddyConfig.EscortTeleportDelayMs;
+
+                    if (cooledDown && sustained)
+                    {
+                        TeleportEscortNear(player, distance);
+                        _lastEscortTeleport = Game.GameTime;
+                        _escortFarSince = 0;
+                        return;
+                    }
+                }
+                else
+                {
+                    _escortFarSince = 0;
                 }
 
                 // ---- 卡住检测 → 自动切到"直接驾驶" ----------------------------
@@ -1184,79 +1209,57 @@ namespace GTA5Buddy
                 // 卡住时给它一段观察期再重发，避免频繁重置
                 if (taskPresent && stalled && Game.GameTime < _nextEscortTask) return;
 
-                _nextEscortTask = Game.GameTime + (taskPresent ? 4000 : 0);
-
-                float cruise = distance > 45.0f ? 35.0f : (_squadIndex == 0 ? 22.0f : 19.0f);
-                string kind;
-
                 // ---- 按载具类型选用对应的任务原生 ------------------------------
                 //
-                // 这是"为什么别人的修改器连直升机、摩托车都能跟随"的答案：
-                // 地面车的驾驶任务对飞行器**完全无效**，必须用专门的任务。
+                // 直升机 / 固定翼用引擎的**持续型追击任务**，下发一次由引擎自己维持。
+                // 地面载具改用 TASK_VEHICLE_GOTO_NAVMESH（用户建议，确实是更合适的选择）：
                 //
-                //   直升机   -> TASK_HELI_CHASE    （持续型追击，带偏移）
-                //   固定翼   -> TASK_PLANE_CHASE
-                //   地面载具 -> 玩家在车上 ESCORT / 玩家步行 FOLLOW(ped)
-                //
-                // 三者都是持续型任务：下发一次，由引擎自己维持追击关系。
+                //   * 它走 **navmesh 寻路**，不是朝目标点走直线；
+                //   * 目标点可以直接给**玩家的实时坐标**，
+                //     而 TASK_VEHICLE_ESCORT 要求目标必须是"载具"（玩家步行时用不了）；
+                //   * 点任务的代价是必须按节奏重发来更新目标点 —— 这本来就是
+                //     "用点任务跟随移动实体"的正确用法。
+                //     之前 1952 次重发的毛病是**每帧**重发；现在是固定间隔，性质不同。
                 if (_escortVehicle.IsHelicopter)
                 {
-                    // 偏移：略靠后上方，避免撞到玩家
-                    Function.Call(Hash.TASK_HELI_CHASE,
-                                  _ped,
-                                  player,
-                                  0.0f, -18.0f, 12.0f);
-                    kind = "HELI_CHASE";
-                }
-                else if (_escortVehicle.IsPlane)
-                {
-                    Function.Call(Hash.TASK_PLANE_CHASE,
-                                  _ped,
-                                  player,
-                                  0.0f, -40.0f, 25.0f);
-                    kind = "PLANE_CHASE";
-                }
-                else if (player.IsInVehicle() && player.CurrentVehicle != null && player.CurrentVehicle.Exists())
-                {
-                    // ---- 玩家在车上：escort（持续型，引擎自己维持编队）----
-                    //
-                    // p3 = mode：Rear(-1) 表示跟在目标车后方
-                    // p7 = -1（惯例值）
-                    // noRoadsDistance：离道路多远之内允许脱离路网，给大一点避免卡住
-                    Function.Call(Hash.TASK_VEHICLE_ESCORT,
-                                  _ped, _escortVehicle, player.CurrentVehicle,
-                                  (int)VehicleEscortType.Rear,
-                                  cruise,
-                                  (int)EscortDrivingFlags,
-                                  15.0f,      // minDistance：保持的最小间距
-                                  -1,
-                                  30.0f);     // noRoadsDistance
-                    kind = "ESCORT(rear)";
-                }
-                else
-                {
-                    // ---- 玩家步行：ped-target 的 Follow 任务（同样是持续型）----
-                    //
-                    // p6 = targetReachedDist：到这个距离就算"跟上"，车会停
-                    // p7 = straightLineDist：**不能设 0**，设 0 会让车试图直线冲向目标
-                    //      （撞墙、抄野地）；给 10 米表示"最后 10 米才走直线"
-                    Function.Call(Hash.TASK_VEHICLE_MISSION_PED_TARGET,
-                                  _ped, _escortVehicle, player,
-                                  7,          // VehicleMissionType.Follow
-                                  cruise,
-                                  (int)EscortDrivingFlags,
-                                  14.0f,      // targetReachedDist
-                                  10.0f,      // straightLineDist
-                                  false);     // driveAgainstTraffic
-                    kind = "FOLLOW(ped)";
+                    if (taskPresent) return;      // 持续型任务，已在下发就别动它
+                    Function.Call(Hash.TASK_HELI_CHASE, _ped, player, 0.0f, -18.0f, 12.0f);
+                    BuddyLog.Info("escort[" + _squadIndex + "]: issued HELI_CHASE");
+                    return;
                 }
 
-                BuddyLog.Info("escort[" + _squadIndex + "]: issued " + kind +
-                              "  wasRunning=" + taskPresent + " status=" + status +
-                              " dist=" + distance.ToString("0.0") +
-                              " cruise=" + cruise.ToString("0.0") +
+                if (_escortVehicle.IsPlane)
+                {
+                    if (taskPresent) return;
+                    Function.Call(Hash.TASK_PLANE_CHASE, _ped, player, 0.0f, -40.0f, 25.0f);
+                    BuddyLog.Info("escort[" + _squadIndex + "]: issued PLANE_CHASE");
+                    return;
+                }
+
+                // ---- 地面载具：GOTO_NAVMESH，按固定节奏更新目标点 ----
+                if (Game.GameTime < _nextEscortTask) return;
+                _nextEscortTask = Game.GameTime + BuddyConfig.NavmeshReissueMs;
+
+                float cruise = distance > 45.0f ? 35.0f : (_squadIndex == 0 ? 24.0f : 20.0f);
+                float stopRange = distance > 45.0f ? 18.0f : 12.0f;
+
+                // 目标点：玩家当前位置。不再用"编队偏移位" ——
+                // 偏移位在玩家移动时经常落在路边/建筑/水里，navmesh 找不到路就停住了。
+                // 保持队形交给引擎的 SET_GROUP_SEPARATION_RANGE 处理。
+                Vector3 dest = player.Position;
+
+                Function.Call(Hash.TASK_VEHICLE_GOTO_NAVMESH,
+                              _ped, _escortVehicle,
+                              dest.X, dest.Y, dest.Z,
+                              cruise,
+                              (int)EscortDrivingFlags,
+                              stopRange);
+
+                BuddyLog.Info("escort[" + _squadIndex + "]: issued GOTO_NAVMESH  dist=" +
+                              distance.ToString("0.0") + " cruise=" + cruise.ToString("0.0") +
+                              " stopRange=" + stopRange.ToString("0.0") +
                               " vehSpeed=" + _escortVehicle.Speed.ToString("0.0") +
-                              " moved=" + moved.ToString("0.0"));
+                              " status=" + status);
             }
             catch (Exception ex) { BuddyLog.Error("UpdateVehicleEscort failed", ex); }
         }
@@ -1718,6 +1721,12 @@ namespace GTA5Buddy
                 _driveTarget = vehicle;
 
                 // 坐驾驶位的人由 escort 逻辑接管驾驶；乘客只要留在车上即可。
+                // 注意：**所有座位都要上锁**，不只是驾驶位。
+                // 之前只对驾驶位调 KeepPedInVehicle，结果就是"只有驾驶员留在车里，
+                // 其他人都跑出去了" —— 因为队友同时是玩家小队成员，小队 AI 会让他们
+                // 下车徒步跟随玩家。
+                KeepPedInVehicle();
+
                 if (seat == VehicleSeat.Driver)
                 {
                     _escortVehicle = vehicle;
@@ -1726,14 +1735,23 @@ namespace GTA5Buddy
                     _nextEscortTask = 0;
                     Function.Call(Hash.SET_DRIVER_ABILITY, _ped, 1.0f);
                     Function.Call(Hash.SET_DRIVER_AGGRESSIVENESS, _ped, 0.5f);
-
-                    KeepPedInVehicle();
                 }
 
                 BuddyLog.Info("vehicle: agent " + _squadIndex + " -> seat " + (int)seat +
-                              (seat == VehicleSeat.Driver ? " (driver, escort armed)" : " (passenger)"));
+                              (seat == VehicleSeat.Driver ? " (driver)" : " (passenger)") +
+                              " model=" + vehicle.Model.Hash);
             }
             catch (Exception ex) { BuddyLog.Error("WarpIntoVehicle failed", ex); }
+        }
+
+        /// <summary>这一位是否正坐在座位上（供队伍统计座位占用）。</summary>
+        internal bool IsSeated
+        {
+            get
+            {
+                try { return _ped != null && _ped.Exists() && _ped.IsInVehicle(); }
+                catch (Exception) { return false; }
+            }
         }
 
         /// <summary>

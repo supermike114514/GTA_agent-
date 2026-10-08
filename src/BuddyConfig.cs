@@ -52,6 +52,30 @@ namespace GTA5Buddy
         /// <summary>进入自己的编队位多少米内就停车（米）。</summary>
         internal const float ConvoySlotArrive = 7.0f;
 
+        /// <summary>
+        /// TASK_VEHICLE_GOTO_NAVMESH 的重发间隔（毫秒）。
+        ///
+        /// 这是个**点任务**，不会自己跟踪移动实体，所以必须按节奏把玩家的新坐标喂给它。
+        /// 间隔要权衡：太短会不断打断路径规划，太长会跟不上移动的玩家。
+        /// 1500ms 在 20 m/s 下对应约 30 米的前瞻，够用。
+        /// </summary>
+        internal const int NavmeshReissueMs = 1500;
+
+        /// <summary>
+        /// 传送冷却（毫秒）。**这是防止"一直在不断传送"的关键。**
+        ///
+        /// 传送本身会让距离瞬间归零，如果没有冷却，下一帧距离又可能因为玩家在动
+        /// 而重新超过阈值，于是反复传送 —— 表现就是队友在你身边闪来闪去。
+        /// 传送后强制安静一段时间，让 AI 有机会自己跟上。
+        /// </summary>
+        internal const int EscortTeleportCooldownMs = 12000;
+
+        /// <summary>
+        /// 距离超过阈值后还要持续这么久才真的传送（毫秒）。
+        /// 避免玩家高速掠过时误触发。
+        /// </summary>
+        internal const int EscortTeleportDelayMs = 3000;
+
         // ---- follow (L2/F1) ----
         internal const float FollowOffsetSide = 1.2f;   // + = to the buddy's right of the player
         internal const float FollowOffsetBack = -1.1f;  // - = behind the player

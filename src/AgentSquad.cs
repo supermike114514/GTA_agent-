@@ -133,6 +133,10 @@ namespace GTA5Buddy
                         car.IsEngineRunning = true;
                         carsMade++;
 
+                        // 登记为小队车辆：之后 EnforceSeating 会用这批车来维持座位，
+                        // 队友被小队 AI 赶下车后会重新被塞回这些座位。
+                        RegisterSquadVehicle(car);
+
                         // 座位总数含驾驶位：PassengerCapacity 不含驾驶员
                         maxSeat = Function.Call<int>(Hash.GET_VEHICLE_MAX_NUMBER_OF_PASSENGERS, car);
                         seat = -1;
@@ -326,8 +330,113 @@ namespace GTA5Buddy
                 {
                     _agents[0].ShowHud = true;
                 }
+
+                EnforceSeating();
             }
             catch (Exception ex) { BuddyLog.Error("squad update failed", ex); }
+        }
+
+        // ==================================================================
+        // 队伍车辆登记 + 座位持续维持
+        //
+        // 用户要求：**检测到玩家在载具内时，agent 要去找之前生成的载具并坐进座位**，
+        // 而且所有座位都要有 agent。
+        //
+        // 为什么必须"持续维持"而不是"安排一次"：
+        //   队友同时是玩家小队成员，小队 AI 会不断让他们下车徒步跟随玩家。
+        //   之前只在点菜单那一刻安排上车，过一会儿车里就只剩驾驶员一个
+        //   ——这正是用户报的"只有驾驶员在车内，其他人依旧在车外"。
+        // ==================================================================
+
+        private readonly List<Vehicle> _squadVehicles = new List<Vehicle>();
+        private int _nextSeatingCheck;
+
+        /// <summary>把一辆车登记为"小队车辆"，座位维持会用到它。</summary>
+        internal void RegisterSquadVehicle(Vehicle vehicle)
+        {
+            try
+            {
+                if (vehicle == null || !vehicle.Exists()) return;
+                if (_squadVehicles.Contains(vehicle)) return;
+
+                _squadVehicles.Add(vehicle);
+
+                int maxSeat = Function.Call<int>(Hash.GET_VEHICLE_MAX_NUMBER_OF_PASSENGERS, vehicle);
+                BuddyLog.Info("squad: registered vehicle model=" + vehicle.Model.Hash +
+                              " seats=" + (maxSeat + 1));
+            }
+            catch (Exception ex) { BuddyLog.Error("RegisterSquadVehicle failed", ex); }
+        }
+
+        /// <summary>
+        /// 持续维持座位：玩家在载具内时，把所有没上车的队友塞进已登记车辆的空座位。
+        ///
+        /// 每 2 秒检查一次 —— 没必要每帧，而且塞人本身是有开销的操作。
+        /// 只在**玩家自己也在载具里**时才做：玩家步行时队友应该跟着走路。
+        /// </summary>
+        private void EnforceSeating()
+        {
+            if (Game.GameTime < _nextSeatingCheck) return;
+            _nextSeatingCheck = Game.GameTime + 2000;
+
+            try
+            {
+                Ped player = Game.Player.Character;
+                if (player == null || !player.Exists()) return;
+
+                if (!player.IsInVehicle()) return;
+
+                // 清掉已被世界回收的车
+                for (int i = _squadVehicles.Count - 1; i >= 0; i--)
+                {
+                    Vehicle v = _squadVehicles[i];
+                    if (v == null || !v.Exists()) _squadVehicles.RemoveAt(i);
+                }
+
+                if (_squadVehicles.Count == 0) return;
+
+                // 找出还没上车的队友
+                var waiting = new List<Companion>();
+                foreach (Companion a in _agents.ToArray())
+                {
+                    if (!a.Exists) continue;
+                    if (!a.IsSeated) waiting.Add(a);
+                }
+
+                if (waiting.Count == 0) return;
+
+                int placed = 0;
+
+                foreach (Vehicle car in _squadVehicles.ToArray())
+                {
+                    if (waiting.Count == 0) break;
+                    if (car == null || !car.Exists()) continue;
+
+                    int maxSeat = Function.Call<int>(Hash.GET_VEHICLE_MAX_NUMBER_OF_PASSENGERS, car);
+
+                    // 座位索引：-1 = 驾驶位，0..maxSeat = 乘客位
+                    for (int seat = -1; seat <= maxSeat && waiting.Count > 0; seat++)
+                    {
+                        bool free;
+                        try { free = car.IsSeatFree((VehicleSeat)seat); }
+                        catch (Exception) { free = false; }
+
+                        if (!free) continue;      // 座位有人，跳过；**不推进 waiting**（关键）
+
+                        Companion agent = waiting[0];
+                        agent.WarpIntoVehicle(car, (VehicleSeat)seat);
+                        waiting.RemoveAt(0);
+                        placed++;
+                    }
+                }
+
+                if (placed > 0)
+                {
+                    BuddyLog.Info("squad: seating pass placed " + placed +
+                                  " agents, " + waiting.Count + " still waiting");
+                }
+            }
+            catch (Exception ex) { BuddyLog.Error("EnforceSeating failed", ex); }
         }
 
         /// <summary>收回全部队友。</summary>
