@@ -351,6 +351,12 @@ namespace GTA5Buddy
         private readonly List<Vehicle> _squadVehicles = new List<Vehicle>();
         private int _nextSeatingCheck;
 
+        /// <summary>
+        /// 座位强锁是否生效。玩家在载具内时为 true —— 期间队友不许下车。
+        /// 玩家下车时解锁，队友才能出来。
+        /// </summary>
+        private bool _seatingLocked;
+
         /// <summary>把一辆车登记为"小队车辆"，座位维持会用到它。</summary>
         internal void RegisterSquadVehicle(Vehicle vehicle)
         {
@@ -369,22 +375,51 @@ namespace GTA5Buddy
         }
 
         /// <summary>
-        /// 持续维持座位：玩家在载具内时，把所有没上车的队友塞进已登记车辆的空座位。
+        /// 座位强锁 + 座位维持。
         ///
-        /// 每 2 秒检查一次 —— 没必要每帧，而且塞人本身是有开销的操作。
-        /// 只在**玩家自己也在载具里**时才做：玩家步行时队友应该跟着走路。
+        /// 用户要求：**"只有玩家下车的时候，agent 才会从车内出来"**。
+        ///
+        /// 光靠配置标志（DontLeaveVehicleIfLeaderNotInVehicle 等）做不到 ——
+        /// 实测队友还是会在玩家停车时下车。所以这里改成**持续强制**：
+        ///
+        ///   玩家在载具内  -> 锁定。每 500ms 检查一次，谁溜下车就立刻塞回座位。
+        ///   玩家下车      -> 解锁。队友可以自由下车。
+        ///
+        /// 两条塞人路径：
+        ///   1. 优先塞回**它自己被安排的那辆车**（自驾跟随的车 / 指定座驾）
+        ///   2. 那辆车满员或不可用时，塞进已登记小队车辆的任意空位
         /// </summary>
         private void EnforceSeating()
         {
             if (Game.GameTime < _nextSeatingCheck) return;
-            _nextSeatingCheck = Game.GameTime + 2000;
+            _nextSeatingCheck = Game.GameTime + BuddyConfig.SeatingLockIntervalMs;
 
             try
             {
                 Ped player = Game.Player.Character;
                 if (player == null || !player.Exists()) return;
 
-                if (!player.IsInVehicle()) return;
+                // ---- 玩家下车 = 解锁，队友可以出来 ----
+                if (!player.IsInVehicle())
+                {
+                    if (_seatingLocked)
+                    {
+                        _seatingLocked = false;
+                        foreach (Companion a in _agents.ToArray())
+                        {
+                            try { a.ReleaseVehicleLock(); } catch (Exception) { }
+                        }
+                        BuddyLog.Info("squad: player left the vehicle, seat lock RELEASED");
+                    }
+                    return;
+                }
+
+                // ---- 玩家上车 = 上锁 ----
+                if (!_seatingLocked)
+                {
+                    _seatingLocked = true;
+                    BuddyLog.Info("squad: player is in a vehicle, seat lock ENGAGED");
+                }
 
                 // 清掉已被世界回收的车
                 for (int i = _squadVehicles.Count - 1; i >= 0; i--)
@@ -393,51 +428,69 @@ namespace GTA5Buddy
                     if (v == null || !v.Exists()) _squadVehicles.RemoveAt(i);
                 }
 
-                if (_squadVehicles.Count == 0) return;
-
-                // 找出还没上车的队友
-                var waiting = new List<Companion>();
+                // 找出溜下车的队友
+                var outside = new List<Companion>();
                 foreach (Companion a in _agents.ToArray())
                 {
                     if (!a.Exists) continue;
-                    if (!a.IsSeated) waiting.Add(a);
+                    if (!a.IsSeated) outside.Add(a);
                 }
 
-                if (waiting.Count == 0) return;
+                if (outside.Count == 0) return;
 
-                int placed = 0;
+                int forcedBack = 0;
+                int relocated = 0;
 
-                foreach (Vehicle car in _squadVehicles.ToArray())
+                // 路径 1：塞回它自己的车
+                foreach (Companion a in outside)
                 {
-                    if (waiting.Count == 0) break;
-                    if (car == null || !car.Exists()) continue;
+                    if (a.ForceBackIntoAssignedVehicle()) forcedBack++;
+                }
 
-                    int maxSeat = Function.Call<int>(Hash.GET_VEHICLE_MAX_NUMBER_OF_PASSENGERS, car);
+                // 路径 2：还在地上的，塞进登记车辆的任意空位
+                var stillOutside = new List<Companion>();
+                foreach (Companion a in outside)
+                {
+                    if (!a.IsSeated) stillOutside.Add(a);
+                }
 
-                    // 座位索引：-1 = 驾驶位，0..maxSeat = 乘客位
-                    for (int seat = -1; seat <= maxSeat && waiting.Count > 0; seat++)
+                if (stillOutside.Count > 0 && _squadVehicles.Count > 0)
+                {
+                    foreach (Vehicle car in _squadVehicles.ToArray())
                     {
-                        bool free;
-                        try { free = car.IsSeatFree((VehicleSeat)seat); }
-                        catch (Exception) { free = false; }
+                        if (stillOutside.Count == 0) break;
+                        if (car == null || !car.Exists()) continue;
 
-                        if (!free) continue;      // 座位有人，跳过；**不推进 waiting**（关键）
+                        int maxSeat = Function.Call<int>(Hash.GET_VEHICLE_MAX_NUMBER_OF_PASSENGERS, car);
 
-                        Companion agent = waiting[0];
-                        agent.WarpIntoVehicle(car, (VehicleSeat)seat);
-                        waiting.RemoveAt(0);
-                        placed++;
+                        for (int seat = -1; seat <= maxSeat && stillOutside.Count > 0; seat++)
+                        {
+                            bool free;
+                            try { free = car.IsSeatFree((VehicleSeat)seat); }
+                            catch (Exception) { free = false; }
+
+                            if (!free) continue;   // 有人，跳过；**不推进等待列表**
+
+                            Companion agent = stillOutside[0];
+                            agent.WarpIntoVehicle(car, (VehicleSeat)seat);
+                            stillOutside.RemoveAt(0);
+                            relocated++;
+                        }
                     }
                 }
 
-                if (placed > 0)
+                if (forcedBack > 0 || relocated > 0)
                 {
-                    BuddyLog.Info("squad: seating pass placed " + placed +
-                                  " agents, " + waiting.Count + " still waiting");
+                    BuddyLog.Info("squad: seat lock put back " + forcedBack +
+                                  " into own vehicle, " + relocated +
+                                  " into squad seats, " + stillOutside.Count + " still outside");
                 }
             }
             catch (Exception ex) { BuddyLog.Error("EnforceSeating failed", ex); }
         }
+
+        /// <summary>座位强锁当前是否生效（玩家在载具内时为 true）。</summary>
+        internal bool SeatingLocked { get { return _seatingLocked; } }
 
         /// <summary>收回全部队友。</summary>
         internal void DespawnAll()

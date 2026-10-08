@@ -1532,12 +1532,13 @@ namespace GTA5Buddy
         }
 
         /// <summary>
-        /// 硬兜底：把队友连人带车传送到玩家附近的路面上。
+        /// 硬兜底：把队友连人带车传送到离玩家约 1.8 公里外的公路上。
         ///
-        /// 触发条件是玩家已经跑出 <see cref="BuddyConfig.EscortTeleportBeyond"/> 米。
-        /// 这是用户明确要求的"硬参数"，也是最有保证的跟随方式：
-        /// 引擎驾驶 AI 对履带/特种载具经常失效，直接控制又容易造成车辆堆积，
-        /// 所以在远距离上直接传送比继续挣扎可靠得多。
+        /// 触发条件是玩家已经跑出 <see cref="BuddyConfig.EscortTeleportBeyond"/> 米（5 公里）。
+        ///
+        /// 为什么落在 1.8 公里外而不是玩家身边：
+        /// 传到眼前会突兀地"冒出来"。落在两公里内的公路上，让 AI 把剩下的路开完，
+        /// 观感上就是"队友从后面追上来了"。
         /// </summary>
         private void TeleportEscortNear(Ped player, float distance)
         {
@@ -1545,24 +1546,75 @@ namespace GTA5Buddy
             {
                 if (_escortVehicle == null || !_escortVehicle.Exists()) return;
 
-                // 落在玩家后方，并吸附到路面，避免传进建筑或墙里
-                Vector3 behind = player.Position - player.ForwardVector * BuddyConfig.EscortTeleportBehind;
-                Vector3 spot = SnapToRoad(behind);
+                // 从玩家指向本车的方向，退到目标距离处 —— 这样队友是从"玩家来的方向"
+                // 那一侧出现，而不是凭空出现在前方。
+                Vector3 away = _escortVehicle.Position - player.Position;
+                float len = away.Length();
+                if (len < 1.0f) away = -player.ForwardVector;
+                else away = away * (1.0f / len);
+
+                float land = BuddyConfig.EscortTeleportLandDistance;
+                if (land > BuddyConfig.EscortTeleportMaxDistance)
+                    land = BuddyConfig.EscortTeleportMaxDistance;
+
+                Vector3 spot = FindRoadSpot(player.Position, away, land);
 
                 _escortVehicle.Position = spot;
                 _escortVehicle.PlaceOnGround();
                 _escortVehicle.IsEngineRunning = true;
 
-                // 司机必须留在驾驶位；传送会把 ped 甩出车外的情况一并处理
+                // 司机必须留在驾驶位：传送会把 ped 甩出车外，这里一并处理
                 Function.Call(Hash.SET_PED_INTO_VEHICLE, _ped, _escortVehicle, (int)VehicleSeat.Driver);
 
                 _lastEscortPos = null;
                 _escortStallSince = 0;
+                _escortDirectDrive = false;   // 新车位，重新给 AI 一次机会
 
-                BuddyLog.Info("escort[" + _squadIndex + "]: TELEPORTED to player (was " +
-                              distance.ToString("0") + "m away)");
+                BuddyLog.Info("escort[" + _squadIndex + "]: TELEPORTED (was " +
+                              distance.ToString("0") + "m away) -> landed " +
+                              _escortVehicle.Position.DistanceTo(player.Position).ToString("0") +
+                              "m from player");
             }
             catch (Exception ex) { BuddyLog.Error("TeleportEscortNear failed", ex); }
+        }
+
+        /// <summary>
+        /// 在玩家周围找一个**公路上的落点**，距离约 <paramref name="wanted"/> 米。
+        ///
+        /// 长距离的位置未必正好压在道路上，所以从目标距离开始逐步往玩家方向收，
+        /// 直到吸附到道路节点为止 —— 避免把车传进荒山、楼顶或水里。
+        /// </summary>
+        private static Vector3 FindRoadSpot(Vector3 origin, Vector3 awayDir, float wanted)
+        {
+            // 先试目标距离，不行就按 80% 递减，最多试 8 次（收到约 0.17 倍）
+            float d = wanted;
+            Vector3 fallback = origin + awayDir * wanted;
+
+            for (int attempt = 0; attempt < 8; attempt++)
+            {
+                Vector3 probe = origin + awayDir * d;
+
+                try
+                {
+                    var outPos = new OutputArgument();
+                    bool ok = Function.Call<bool>(Hash.GET_CLOSEST_VEHICLE_NODE,
+                                                  probe.X, probe.Y, probe.Z,
+                                                  outPos, 1, 60.0f, 0f);
+                    if (ok)
+                    {
+                        Vector3 node = outPos.GetResult<Vector3>();
+                        // 道路节点有时吸到高架/地下，Z 差太多就当成没找到
+                        if (Math.Abs(node.Z - probe.Z) < 25.0f && node.DistanceTo(origin) <= BuddyConfig.EscortTeleportMaxDistance)
+                            return node;
+                    }
+                }
+                catch (Exception) { }
+
+                fallback = probe;      // 记下最后一个位置，作为兜底
+                d *= 0.8f;
+            }
+
+            return fallback;
         }
 
         /// <summary>
@@ -1703,6 +1755,64 @@ namespace GTA5Buddy
         /// <summary>由 AgentSquad 指定这一位的皮肤（生成前调用）。</summary>
         internal void SetSpawnModel(PedHash hash) { _spawnModel = hash; }
 
+        /// <summary>
+        /// 这一位被安排的车（自驾跟随的车，或指定座驾）。
+        /// 座位强锁用它来把溜下车的队友塞回去。
+        /// </summary>
+        internal Vehicle AssignedVehicle
+        {
+            get
+            {
+                try
+                {
+                    if (_escortVehicle != null && _escortVehicle.Exists()) return _escortVehicle;
+                    if (_driveTarget != null && _driveTarget.Exists()) return _driveTarget;
+                }
+                catch (Exception) { }
+                return null;
+            }
+        }
+
+        /// <summary>
+        /// 座位强锁：把这一位立刻按回它自己的车里。
+        ///
+        /// 用于"玩家在车上时队友不许下车"。做法是先找它原来的座位，
+        /// 座位被占了就找任意空位；找不到空位才退到驾驶位。
+        ///
+        /// 返回是否成功把它放回车上。
+        /// </summary>
+        internal bool ForceBackIntoAssignedVehicle()
+        {
+            try
+            {
+                if (!Exists) return false;
+                if (_ped.IsInVehicle()) return true;      // 已经在车上，不用管
+
+                Vehicle car = AssignedVehicle;
+                if (car == null || !car.Exists()) return false;
+
+                // 优先坐回驾驶位（自驾跟随的情况）；否则找第一个空位
+                int maxSeat = Function.Call<int>(Hash.GET_VEHICLE_MAX_NUMBER_OF_PASSENGERS, car);
+
+                int chosen = int.MinValue;
+                for (int seat = -1; seat <= maxSeat; seat++)
+                {
+                    bool free;
+                    try { free = car.IsSeatFree((VehicleSeat)seat); }
+                    catch (Exception) { free = false; }
+
+                    if (free) { chosen = seat; break; }
+                }
+
+                if (chosen == int.MinValue) return false;   // 车满了
+
+                Function.Call(Hash.SET_PED_INTO_VEHICLE, _ped, car, chosen);
+                KeepPedInVehicle();
+                return true;
+            }
+            catch (Exception) { return false; }
+        }
+
         /// <summary>把这一位直接放进指定座位（用于队伍安排上车）。</summary>
         internal void WarpIntoVehicle(Vehicle vehicle, VehicleSeat seat)
         {
@@ -1787,7 +1897,12 @@ namespace GTA5Buddy
         }
 
         /// <summary>解除"必须待在车里"的限制，恢复正常的 AI 反应。</summary>
-        private void ReleasePedVehicleLock()
+        internal void ReleasePedVehicleLock() { ReleaseVehicleLock(); }
+
+        /// <summary>
+        /// 解除载具锁定。玩家下车时由 AgentSquad 调用 —— 这时队友可以自由下车。
+        /// </summary>
+        internal void ReleaseVehicleLock()
         {
             try
             {
