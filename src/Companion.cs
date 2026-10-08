@@ -863,6 +863,10 @@ namespace GTA5Buddy
         private bool _escortLongRange;     // 已切到 DRIVE_TO_COORD_LONGRANGE
         private bool _escortClearedOnce;   // 已清空过一次任务让引擎重规划
 
+        // 当前下发的任务类型（VehicleMissionType 的整数值）。
+        // 用它判断"意图有没有变" —— 任务类型是持续型的，意图不变就不该重发。
+        private int _currentMission = -1;
+
         /// <summary>
         /// 变形金刚模式：保留最初的"直接推"行为。
         ///
@@ -1040,20 +1044,37 @@ namespace GTA5Buddy
         }
 
         /// <summary>
-        /// 驾驶跟随的标志位。
+        /// 跟随驾驶的标志位。
         ///
-        /// 关键是这两个（默认的 Normal=786603 里**没有**它们，这正是车不走道路的原因）：
+        /// 参考 GTA 自己的追车/护卫设计：它**不是**用一个"到点导航"任务，
+        /// 而是用 VehicleMissionType 表达意图，再由引擎决定怎么开。
+        /// 这里配上与那种场景相符的驾驶风格 —— 比"老老实实跟车"更能跟上：
         ///
-        ///   PreferNavmeshRoute              —— 优先走道路网路径
+        ///   AvoidVehicles / AvoidPeds / AvoidObjects
+        ///       —— 基本避让，别去撞人撞车
+        ///   StopAtTrafficLights              —— 该停的灯还是停
+        ///   GoOffRoadWhenAvoiding            —— 堵住了允许绕下路肩，否则会死等
+        ///   AllowGoingWrongWay               —— 允许逆行超车（跟丢时很关键）
+        ///   ChangeLanesAroundObstructions    —— 前方有障碍主动变道
         ///   UseWanderFallbackInsteadOfStraightLine
-        ///                                   —— 寻路失败时沿路绕行，而不是朝目标直冲
+        ///       —— 寻路失败时沿路绕行，而不是朝目标直冲
+        ///   PreferNavmeshRoute               —— 优先走道路网
+        ///   UseStringPullingAtJunctions      —— 路口抄近路，转弯更顺（引擎的追车手法）
         ///
-        /// 其余位保持"遵守交通、避让行人车辆"的常规行为。
+        /// 刻意**不用** DrivingModePloughThrough / DrivingModeAvoidVehiclesReckless：
+        /// 那会让队友横冲直撞，把路上的平民和玩家一起撞飞。
         /// </summary>
         private const VehicleDrivingFlags EscortDrivingFlags =
-            VehicleDrivingFlags.DrivingModeStopForVehicles
+            VehicleDrivingFlags.SwerveAroundAllVehicles
+            | VehicleDrivingFlags.SteerAroundPeds
+            | VehicleDrivingFlags.SteerAroundObjects
+            | VehicleDrivingFlags.StopAtTrafficLights
+            | VehicleDrivingFlags.GoOffRoadWhenAvoiding
+            | VehicleDrivingFlags.AllowGoingWrongWay
+            | VehicleDrivingFlags.ChangeLanesAroundObstructions
+            | VehicleDrivingFlags.UseWanderFallbackInsteadOfStraightLine
             | VehicleDrivingFlags.PreferNavmeshRoute
-            | VehicleDrivingFlags.UseWanderFallbackInsteadOfStraightLine;
+            | VehicleDrivingFlags.UseStringPullingAtJunctions;
 
         /// <summary>
         /// Per-tick upkeep for escort mode.
@@ -1260,20 +1281,32 @@ namespace GTA5Buddy
                     return;
                 }
 
-                // ---- 按载具类型选用对应的任务原生 ------------------------------
+                // ==================================================================
+                // 用引擎的"任务类型"系统驾驶（参考 GTA 自己的追车 / 攻击小队设计）
                 //
-                // 直升机 / 固定翼用引擎的**持续型追击任务**，下发一次由引擎自己维持。
-                // 地面载具改用 TASK_VEHICLE_GOTO_NAVMESH（用户建议，确实是更合适的选择）：
+                // GTA 本体的追车和护卫**不是**用"到点导航"任务，而是用
+                // VehicleMissionType 表达**意图**，再由引擎决定怎么开：
                 //
-                //   * 它走 **navmesh 寻路**，不是朝目标点走直线；
-                //   * 目标点可以直接给**玩家的实时坐标**，
-                //     而 TASK_VEHICLE_ESCORT 要求目标必须是"载具"（玩家步行时用不了）；
-                //   * 点任务的代价是必须按节奏重发来更新目标点 —— 这本来就是
-                //     "用点任务跟随移动实体"的正确用法。
-                //     之前 1952 次重发的毛病是**每帧**重发；现在是固定间隔，性质不同。
+                //     Follow(7)      跟住那个 ped —— 引擎自己处理变道、超车、绕障
+                //     EscortRear(12) 跟在那辆车的后方
+                //     Attack(6)      攻击那个目标（攻击小队用的）
+                //     PoliceBehaviour(16) 警察追车 AI 用的行为
+                //
+                // 用它的好处是这些能力全部由引擎提供，我不需要自己实现：
+                // 变道超车、绕开障碍、寻路失败时沿路绕行、路口抄近路（StringPulling）。
+                //
+                // 之前用的 GOTO_NAVMESH 是"点任务" —— 它只知道一个坐标，
+                // 既不会变道也不会超车，还必须每 1.5 秒喂新坐标，
+                // 每次喂都可能打断路径规划。**这正是"跟不住"的结构性原因。**
+                //
+                // 任务类型是**持续型**的：只有"意图变了"才需要重新下发，
+                // 不需要按节奏重发。这一点由 _currentMission 记录来保证。
+                // ==================================================================
+
+                // 飞行器：引擎有专门的追击任务
                 if (_escortVehicle.IsHelicopter)
                 {
-                    if (taskPresent) return;      // 持续型任务，已在下发就别动它
+                    if (taskPresent) return;
                     Function.Call(Hash.TASK_HELI_CHASE, _ped, player, 0.0f, -18.0f, 12.0f);
                     BuddyLog.Info("escort[" + _squadIndex + "]: issued HELI_CHASE");
                     return;
@@ -1287,30 +1320,90 @@ namespace GTA5Buddy
                     return;
                 }
 
-                // ---- 地面载具：GOTO_NAVMESH，按固定节奏更新目标点 ----
-                if (Game.GameTime < _nextEscortTask) return;
-                _nextEscortTask = Game.GameTime + BuddyConfig.NavmeshReissueMs;
+                // ---- 决定当前该用哪种任务类型 ----
+                //
+                // 战意优先：附近有敌人就切到 Attack（引擎的攻击任务会主动逼近并交战）。
+                Ped enemy = FindCombatTarget(player);
 
-                float cruise = distance > 45.0f ? 35.0f : (_squadIndex == 0 ? 24.0f : 20.0f);
-                float stopRange = distance > 45.0f ? 18.0f : 12.0f;
+                Vehicle playerCar = null;
+                try
+                {
+                    if (player.IsInVehicle()) playerCar = player.CurrentVehicle;
+                    if (playerCar != null && !playerCar.Exists()) playerCar = null;
+                }
+                catch (Exception) { }
 
-                // 目标点：玩家当前位置。不再用"编队偏移位" ——
-                // 偏移位在玩家移动时经常落在路边/建筑/水里，navmesh 找不到路就停住了。
-                // 保持队形交给引擎的 SET_GROUP_SEPARATION_RANGE 处理。
-                Vector3 dest = player.Position;
+                int wantMission;
+                if (enemy != null) wantMission = (int)VehicleMissionType.Attack;          // 6
+                else if (playerCar != null) wantMission = (int)VehicleMissionType.EscortRear;  // 12
+                else wantMission = (int)VehicleMissionType.Follow;                        // 7
 
-                Function.Call(Hash.TASK_VEHICLE_GOTO_NAVMESH,
-                              _ped, _escortVehicle,
-                              dest.X, dest.Y, dest.Z,
-                              cruise,
-                              (int)EscortDrivingFlags,
-                              stopRange);
+                // 意图没变、任务还在、车也没卡住 —— 什么都不做，别去打断引擎
+                if (wantMission == _currentMission && taskPresent && !stalled) return;
 
-                BuddyLog.Info("escort[" + _squadIndex + "]: issued GOTO_NAVMESH  dist=" +
-                              distance.ToString("0.0") + " cruise=" + cruise.ToString("0.0") +
-                              " stopRange=" + stopRange.ToString("0.0") +
+                // 卡住时给它一段观察期再重发
+                if (stalled && Game.GameTime < _nextEscortTask) return;
+                _nextEscortTask = Game.GameTime + 3000;
+
+                _currentMission = wantMission;
+
+                float cruise = distance > 45.0f ? 38.0f : (_squadIndex == 0 ? 26.0f : 22.0f);
+                string kind;
+
+                if (enemy != null)
+                {
+                    // ---- Attack(6)：目标是人 ----
+                    //
+                    // p6 = 到达判定距离，p7 = 直线段距离（不能给 0，否则会直冲）
+                    // p8 = true 表示允许离开道路追击
+                    Function.Call(Hash.TASK_VEHICLE_MISSION_PED_TARGET,
+                                  _ped, _escortVehicle, enemy,
+                                  (int)VehicleMissionType.Attack,
+                                  cruise,
+                                  (int)EscortDrivingFlags,
+                                  8.0f,      // 靠到这个距离就算咬住
+                                  8.0f,
+                                  true);     // 允许脱离道路
+                    kind = "ATTACK";
+                }
+                else if (playerCar != null)
+                {
+                    // ---- EscortRear(-1 / 12)：跟在那辆车后方 ----
+                    //
+                    // noRoadsDistance 给大一点：玩家经常开下公路，
+                    // 给 40 米让队友也敢跟下去，而不是在路边干等。
+                    Function.Call(Hash.TASK_VEHICLE_ESCORT,
+                                  _ped, _escortVehicle, playerCar,
+                                  (int)VehicleEscortType.Rear,
+                                  cruise,
+                                  (int)EscortDrivingFlags,
+                                  12.0f,     // minDistance：保持的最小间距
+                                  -1,
+                                  40.0f);    // noRoadsDistance
+                    kind = "ESCORT_REAR";
+                }
+                else
+                {
+                    // ---- Follow(7)：目标是人（玩家步行）----
+                    //
+                    // p6 = targetReachedDist：到这个距离就算跟上，车会停
+                    // p7 = straightLineDist：**不能设 0**，设 0 会让车直线冲向目标
+                    Function.Call(Hash.TASK_VEHICLE_MISSION_PED_TARGET,
+                                  _ped, _escortVehicle, player,
+                                  (int)VehicleMissionType.Follow,
+                                  cruise,
+                                  (int)EscortDrivingFlags,
+                                  12.0f,     // targetReachedDist
+                                  10.0f,     // straightLineDist
+                                  false);    // 不逆行（只是跟随）
+                    kind = "FOLLOW_PED";
+                }
+
+                BuddyLog.Info("escort[" + _squadIndex + "]: issued " + kind +
+                              "  dist=" + distance.ToString("0.0") +
+                              " cruise=" + cruise.ToString("0.0") +
                               " vehSpeed=" + _escortVehicle.Speed.ToString("0.0") +
-                              " status=" + status);
+                              " status=" + status + " taskPresent=" + taskPresent);
             }
             catch (Exception ex) { BuddyLog.Error("UpdateVehicleEscort failed", ex); }
         }
