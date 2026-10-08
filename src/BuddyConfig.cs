@@ -91,6 +91,16 @@ namespace GTA5Buddy
         /// </summary>
         internal const int SeatingLockIntervalMs = 500;
 
+        /// <summary>
+        /// 乘车战斗的敌人扫描半径（米）。
+        ///
+        /// 为什么需要主动扫描：escort（开车跟随）模式**跳过了整个状态机**，
+        /// 而威胁缓存 _threat 正是在状态机的战斗分支里被赋值的 ——
+        /// 于是开车跟随期间它永远是 null。
+        /// 日志证据：vehicle combat / engaging 出现 **0 次**，战斗从未触发过。
+        /// </summary>
+        internal const float VehicleCombatScanRadius = 70.0f;
+
         // ---- follow (L2/F1) ----
         internal const float FollowOffsetSide = 1.2f;   // + = to the buddy's right of the player
         internal const float FollowOffsetBack = -1.1f;  // - = behind the player

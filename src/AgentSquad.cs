@@ -433,7 +433,10 @@ namespace GTA5Buddy
                 foreach (Companion a in _agents.ToArray())
                 {
                     if (!a.Exists) continue;
-                    if (!a.IsSeated) outside.Add(a);
+                    // 宽限期：只在确实离开载具一段时间后才塞回去。
+                    // 每 500ms 无条件塞人会让 SET_PED_INTO_VEHICLE 反复清掉
+                    // 脚本任务（驾驶 + 射击），实测造成 802 次 "re-seated" 抖动。
+                    if (a.OutsideFor(1500)) outside.Add(a);
                 }
 
                 if (outside.Count == 0) return;
@@ -451,7 +454,7 @@ namespace GTA5Buddy
                 var stillOutside = new List<Companion>();
                 foreach (Companion a in outside)
                 {
-                    if (!a.IsSeated) stillOutside.Add(a);
+                    if (a.OutsideFor(1500)) stillOutside.Add(a);
                 }
 
                 if (stillOutside.Count > 0 && _squadVehicles.Count > 0)

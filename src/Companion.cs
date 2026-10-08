@@ -1506,13 +1506,20 @@ namespace GTA5Buddy
         }
 
         /// <summary>
-        /// 找我方当前应该打的敌人。
+        /// 找当前应该打的敌人。
         ///
-        /// 优先级：玩家正在交战的敌人 -> 队友自己已锁定的威胁 -> 被攻击我方的敌人。
-        /// 找不到就返回 null。
+        /// 这里必须**主动扫描**，不能只靠缓存：
+        ///
+        ///   原实现只在玩家 IsInCombat 时去查，或者用 _threat 字段。
+        ///   但 escort（开车跟随）模式**跳过了整个状态机**，而 _threat 正是在状态机的
+        ///   战斗分支里被赋值的 —— 于是开车跟随期间 _threat 永远是 null。
+        ///   日志证据：vehicle combat / engaging 出现 **0 次**，战斗从未触发过。
+        ///
+        /// 所以改成三级查找：玩家交战的敌人 -> 已缓存威胁 -> **主动扫描附近敌对 ped**。
         /// </summary>
         private Ped FindCombatTarget(Ped player)
         {
+            // 1. 玩家正在交战的敌人
             try
             {
                 if (player != null && player.Exists() && player.IsInCombat)
@@ -1523,12 +1530,78 @@ namespace GTA5Buddy
             }
             catch (Exception) { }
 
+            // 2. 队友自己已经锁定的威胁
             try
             {
                 if (_threat != null && _threat.Exists() && !_threat.IsDead) return _threat;
             }
             catch (Exception) { }
 
+            // 3. 主动扫描：附近有没有和我们敌对的 ped
+            return ScanForHostileNearby(player);
+        }
+
+        /// <summary>
+        /// 主动扫描附近的敌对 ped。
+        ///
+        /// 判据（满足其一即视为敌人）：
+        ///   * 它正在开火 / 处于战斗状态
+        ///   * 它和我们这一位的关系是 Dislike(4) 或 Hate(5)
+        ///
+        /// 跳过友军：玩家本人、队友、以及同小队成员。
+        /// </summary>
+        private Ped ScanForHostileNearby(Ped player)
+        {
+            try
+            {
+                Vector3 origin = (player != null && player.Exists())
+                    ? player.Position
+                    : (_ped != null && _ped.Exists() ? _ped.Position : Vector3.Zero);
+
+                if (origin == Vector3.Zero) return null;
+
+                foreach (Ped p in World.GetNearbyPeds(origin, BuddyConfig.VehicleCombatScanRadius))
+                {
+                    if (p == null || !p.Exists() || p.IsDead) continue;
+                    if (player != null && p == player) continue;
+                    if (p == _ped) continue;
+
+                    // 跳过同小队成员
+                    try
+                    {
+                        if (Function.Call<bool>(Hash.IS_PED_GROUP_MEMBER, p,
+                                                Function.Call<int>(Hash.GET_PED_GROUP_INDEX, player)))
+                            continue;
+                    }
+                    catch (Exception) { }
+
+                    bool hostile = false;
+
+                    try
+                    {
+                        int rel = Function.Call<int>(Hash.GET_RELATIONSHIP_BETWEEN_PEDS, _ped, p);
+                        if (rel == 4 || rel == 5) hostile = true;      // Dislike / Hate
+                    }
+                    catch (Exception) { }
+
+                    if (!hostile)
+                    {
+                        try
+                        {
+                            if (p.IsInCombat || p.IsShooting) hostile = true;
+                        }
+                        catch (Exception) { }
+                    }
+
+                    if (hostile)
+                    {
+                        // 记到 _threat 上，后续帧就能直接命中缓存
+                        _threat = p;
+                        return p;
+                    }
+                }
+            }
+            catch (Exception) { }
             return null;
         }
 
@@ -1643,21 +1716,9 @@ namespace GTA5Buddy
             {
                 if (_ped == null || !_ped.Exists() || !_ped.IsInVehicle()) return;
 
-                // 找目标：优先玩家正在交战的敌人，其次队友自己的威胁
-                Ped enemy = null;
-                try
-                {
-                    if (player != null && player.Exists() && player.IsInCombat)
-                    {
-                        enemy = FindThreat(player);
-                    }
-                }
-                catch (Exception) { }
-
-                if (enemy == null || !enemy.Exists() || enemy.IsDead)
-                {
-                    if (_threat != null && _threat.Exists() && !_threat.IsDead) enemy = _threat;
-                }
+                // 用统一的查找（含**主动扫描**）—— 原来只看 player.IsInCombat 和 _threat，
+                // 而 escort 模式下 _threat 永远是 null，所以战斗从未触发。
+                Ped enemy = FindCombatTarget(player);
 
                 if (enemy == null || !enemy.Exists() || enemy.IsDead)
                 {
@@ -1959,6 +2020,7 @@ namespace GTA5Buddy
 
                 // 驾驶员要留在驾驶位；乘客由 AgentSquad 的座位强锁维持
                 KeepPedInVehicle();
+                PrepareVehicleCombat();   // 换单手武器 + 战斗属性，否则车内无法还击
 
                 BuddyLog.Info("escort[" + _squadIndex + "]: armed on existing vehicle model=" +
                               vehicle.Model.Hash);
@@ -2019,6 +2081,7 @@ namespace GTA5Buddy
 
                 Function.Call(Hash.SET_PED_INTO_VEHICLE, _ped, car, chosen);
                 KeepPedInVehicle();
+                PrepareVehicleCombat();   // 换单手武器 + 战斗属性，否则车内无法还击
                 return true;
             }
             catch (Exception) { return false; }
@@ -2047,6 +2110,7 @@ namespace GTA5Buddy
                 // 其他人都跑出去了" —— 因为队友同时是玩家小队成员，小队 AI 会让他们
                 // 下车徒步跟随玩家。
                 KeepPedInVehicle();
+                PrepareVehicleCombat();   // 换单手武器 + 战斗属性，否则车内无法还击
 
                 if (seat == VehicleSeat.Driver)
                 {
@@ -2073,6 +2137,44 @@ namespace GTA5Buddy
                 try { return _ped != null && _ped.Exists() && _ped.IsInVehicle(); }
                 catch (Exception) { return false; }
             }
+        }
+
+        private int _outsideSince;
+
+        /// <summary>
+        /// 这一位是否**已经离开载具超过 <paramref name="ms"/> 毫秒**。
+        ///
+        /// 为什么需要"离开多久"而不是简单的"在不在车上"：
+        ///
+        ///   座位强锁每 500ms 调一次 SET_PED_INTO_VEHICLE 把人塞回去。
+        ///   但那个原生**会清掉 ped 当前的脚本任务** —— 驾驶任务和射击任务
+        ///   全部被取消。实测日志里 "re-seated driver" 出现 **802 次**，
+        ///   意味着队友的驾驶/战斗任务在那段时间里被反复打断，什么都做不成。
+        ///
+        /// 加一个宽限期：只在确实离开了一段时间之后才塞回去，
+        /// 中间这段时间留给驾驶任务和战斗任务执行。
+        /// 真正的保障是配置标志（PreventVehExitDueToInvalidWeapon 等），
+        /// 从源头减少他们下车的动机。
+        /// </summary>
+        internal bool OutsideFor(int ms)
+        {
+            try
+            {
+                if (IsSeated)
+                {
+                    _outsideSince = 0;
+                    return false;
+                }
+
+                if (_outsideSince == 0)
+                {
+                    _outsideSince = Game.GameTime;
+                    return false;
+                }
+
+                return Game.GameTime - _outsideSince >= ms;
+            }
+            catch (Exception) { return false; }
         }
 
         /// <summary>
@@ -2103,8 +2205,75 @@ namespace GTA5Buddy
                 _ped.SetConfigFlag(PedConfigFlagToggles.DontLeaveVehicleIfLeaderNotInVehicle, true);
                 _ped.SetConfigFlag(PedConfigFlagToggles.DontDragMeOutCar, true);
                 _ped.SetConfigFlag(PedConfigFlagToggles.StayInCarOnJack, true);
+
+                // ---- 针对"队友疯狂跳车"的两条关键标志 ----------------------------
+                //
+                // 实测日志里 re-seated driver 出现了 **802 次** —— 队友在拼命下车。
+                //
+                // 最大嫌疑是 PreventVehExitDueToInvalidWeapon：
+                // 如果队友身上是**长武器**（步枪、狙击枪等），这类武器在 GTA 里
+                // **不能在车内使用**，引擎会因此**强制他下车去开枪**；
+                // 我的座位锁又把他塞回去 -> 死循环。
+                //
+                // 这两条标志从源头堵住：不许因为武器不合适而下车，也不许跟着队长跳车。
+                _ped.SetConfigFlag(PedConfigFlagToggles.PreventVehExitDueToInvalidWeapon, true);
+                _ped.SetConfigFlag(PedConfigFlagToggles.DisableJumpingFromVehiclesAfterLeader, true);
+
+                // 明确允许车载战斗（这条若为 true 会彻底禁掉车内的还击能力）
+                _ped.SetConfigFlag(PedConfigFlagToggles.DisableVehicleCombat, false);
+                _ped.SetConfigFlag(PedConfigFlagToggles.CanBeShotInVehicle, true);
             }
             catch (Exception ex) { BuddyLog.Error("KeepPedInVehicle failed", ex); }
+        }
+
+        /// <summary>
+        /// 乘车战斗的准备：换成**单手武器** + 打开战斗属性。
+        ///
+        /// 为什么必须换单手武器：
+        ///   在 GTA 里**只有单手武器能在车内使用**（微型冲锋枪、手枪、AP 手枪、
+        ///   短管霰弹枪）。队友如果拿着步枪/狙击枪，引擎会判定"武器不能在车内使用"，
+        ///   于是强制他下车 —— 这正是队友反复跳车、且在车里一枪不放的根本原因。
+        ///
+        /// 战斗属性让引擎自己的战斗 AI 能接管射击，不需要我每帧下发射击任务
+        /// （驾驶任务和射击任务共用同一个脚本任务槽位，互相取消）。
+        /// </summary>
+        private void PrepareVehicleCombat()
+        {
+            try
+            {
+                if (_ped == null || !_ped.Exists()) return;
+
+                // ---- 1. 换单手武器（能在车内使用）----
+                Hash current = Function.Call<Hash>(Hash.GET_BEST_PED_WEAPON, _ped, false);
+                bool alreadyOneHanded = current == (Hash)(uint)WeaponHash.MicroSMG ||
+                                        current == (Hash)(uint)WeaponHash.APPistol ||
+                                        current == (Hash)(uint)WeaponHash.Pistol ||
+                                        current == (Hash)(uint)WeaponHash.CombatPistol;
+
+                if (!alreadyOneHanded)
+                {
+                    Function.Call(Hash.GIVE_WEAPON_TO_PED, _ped,
+                                  (Hash)(uint)WeaponHash.MicroSMG, 9999, false, true);
+                    Function.Call(Hash.SET_PED_INFINITE_AMMO, _ped, true,
+                                  (Hash)(uint)WeaponHash.MicroSMG);
+                    BuddyLog.Info("escort[" + _squadIndex +
+                                  "]: switched to a one-handed weapon for in-vehicle use");
+                }
+
+                // ---- 2. 战斗属性：让引擎的战斗 AI 能接管 ----
+                //   5  = AlwaysFight（见到敌人就打，不等被攻击）
+                //   46 = CanFightArmedPedsWhenNotArmed
+                //   1  = CanUseVehicles
+                Function.Call(Hash.SET_PED_COMBAT_ATTRIBUTES, _ped, 5, true);
+                Function.Call(Hash.SET_PED_COMBAT_ATTRIBUTES, _ped, 46, true);
+                Function.Call(Hash.SET_PED_COMBAT_ATTRIBUTES, _ped, 1, true);
+
+                Function.Call(Hash.SET_PED_COMBAT_ABILITY, _ped, 2);   // 2 = 专业水平
+                Function.Call(Hash.SET_PED_COMBAT_RANGE, _ped, 2);     // 2 = 远距离
+                Function.Call(Hash.SET_PED_ACCURACY, _ped, 55);
+                Function.Call(Hash.SET_PED_ALERTNESS, _ped, 3);        // 3 = 最高警觉
+            }
+            catch (Exception ex) { BuddyLog.Error("PrepareVehicleCombat failed", ex); }
         }
 
         /// <summary>解除"必须待在车里"的限制，恢复正常的 AI 反应。</summary>
