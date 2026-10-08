@@ -2,23 +2,30 @@
 rem ===========================================================================
 rem  GTA5Buddy 队友模组 - 故障排查工具
 rem
+rem  【重要】文件名必须是纯 ASCII（troubleshoot.bat）。
+rem
+rem  原因：自我提权要把自己的路径嵌进 powershell 命令行。如果路径里有中文，
+rem  cmd 以 GBK 传命令行、PowerShell 用另一种编码解析，路径会损坏，
+rem  脚本在那一步直接报错退出（表现为窗口一闪就关、有红字）。
+rem  文件名保持 ASCII，嵌入的命令行就全是 ASCII，提权才能可靠工作。
+rem  脚本**内容**里的中文没有问题 —— 那是 cmd 自己显示，不经过命令行传递。
+rem
 rem  三件事：
 rem    1. 结束卡死的 GTA5_Enhanced.exe
-rem       —— 游戏卡在启动阶段时会留下一个 0 CPU 的僵尸进程，
-rem          Steam/启动器会认为"游戏已在运行"，于是再启动就没反应。
-rem          这种进程通常以管理员权限运行，普通任务管理器看不到也结束不掉，
-rem          所以本脚本会先自我提权。
+rem       游戏卡在启动阶段会留下一个 0 CPU 的僵尸进程，Steam/启动器会认为
+rem       "游戏已在运行"，于是再启动毫无反应。这种进程通常以管理员权限运行，
+rem       普通任务管理器看不到也结束不掉，所以本脚本先自我提权。
 rem
 rem    2. 禁用 / 启用全部模组
-rem       —— ScriptHookV 靠 dinput8.dll 注入。把它改名，SHV 和所有依赖它的
-rem          模组都不会加载，用来判断"问题在模组"还是"问题在游戏本身"。
-rem          只是改名，不删除任何文件。
+rem       ScriptHookV 靠 dinput8.dll 注入。把它改名，SHV 和所有依赖它的模组
+rem       都不会加载，用来判断"问题在模组"还是"问题在游戏本身"。只改名不删除。
 rem
 rem  支持参数：kill / disable / enable / status
 rem ===========================================================================
 setlocal EnableDelayedExpansion
 title GTA5Buddy 故障排查
 
+set "SELFPATH=%~dp0%~nx0"
 set "GAMEDIR=E:\SteamLibrary\steamapps\common\Grand Theft Auto V Enhanced"
 set "LOADER=%GAMEDIR%\dinput8.dll"
 set "LOADER_OFF=%GAMEDIR%\dinput8.dll.off"
@@ -26,15 +33,23 @@ set "ARGS=%GAMEDIR%\args.txt"
 set "ARGS_OFF=%GAMEDIR%\args.txt.off"
 set "ACTION=%~1"
 
-rem --- 提权：fltmc 只有管理员能成功执行 --------------------------------------
-rem 结束卡死进程需要管理员权限（那种进程本身就是以管理员启动的）。
-fltmc >nul 2>&1
-if errorlevel 1 (
+rem --- 提权 ----------------------------------------------------------------
+rem 与 一键安装.bat 用同一种判定（net session 失败 = 不是管理员）。
+net session >nul 2>&1
+if not %errorlevel%==0 (
     echo.
     echo   正在请求管理员权限...
     echo   ^(会弹出 UAC 窗口，请点"是"^)
     echo.
-    powershell -NoProfile -Command "Start-Process -FilePath '%~f0' -ArgumentList '%ACTION%' -Verb RunAs"
+    rem 只嵌 %SELFPATH%（纯 ASCII 路径），不做引号转义 —— 之前包一层 cmd 并转义引号反而失败。
+    powershell -NoProfile -Command "Start-Process -FilePath '%SELFPATH%' -Verb RunAs"
+    if errorlevel 1 (
+        echo.
+        echo   [失败] 无法自动提权。
+        echo   请右键本文件 -^> 以管理员身份运行。
+        echo.
+        pause
+    )
     exit /b
 )
 
@@ -92,21 +107,19 @@ tasklist /FI "IMAGENAME eq GTA5_Enhanced.exe" 2>nul | find /I "GTA5_Enhanced.exe
 if errorlevel 1 (
     echo     [跳过] 没有正在运行的 GTA5_Enhanced.exe
     echo            游戏当前是干净状态，可以直接启动。
-) else (
-    echo     找到卡死的进程，正在强制结束...
-    taskkill /F /IM GTA5_Enhanced.exe 2>&1 | findstr /I "SUCCESS 成功" >nul
-    if errorlevel 1 (
-        taskkill /F /IM GTA5_Enhanced.exe
-    )
-    echo.
-    echo     再次确认：
-    tasklist /FI "IMAGENAME eq GTA5_Enhanced.exe" 2>nul | find /I "GTA5_Enhanced.exe" >nul
-    if errorlevel 1 (
-        echo     [完成] 进程已结束。现在可以从 Rockstar 启动器启动游戏了。
-    ) else (
-        echo     [警告] 进程仍在。请重启电脑，或手动用管理员任务管理器结束它。
-    )
+    goto kill_done
 )
+echo     找到进程，正在强制结束...
+taskkill /F /IM GTA5_Enhanced.exe
+echo.
+echo     再次确认：
+tasklist /FI "IMAGENAME eq GTA5_Enhanced.exe" 2>nul | find /I "GTA5_Enhanced.exe" >nul
+if errorlevel 1 (
+    echo     [完成] 进程已结束。现在可以从 Rockstar 启动器启动游戏。
+) else (
+    echo     [警告] 进程仍在。请重启电脑，或用管理员任务管理器手动结束。
+)
+:kill_done
 echo.
 pause
 goto menu
@@ -177,7 +190,7 @@ echo   === 最新日志时间 ===
 if exist "%GAMEDIR%\ScriptHookV.log" for %%F in ("%GAMEDIR%\ScriptHookV.log") do echo     ScriptHookV.log    %%~tF
 if exist "%GAMEDIR%\asiloader.log"  for %%F in ("%GAMEDIR%\asiloader.log")  do echo     asiloader.log      %%~tF
 echo.
-echo     ^(如果这些时间停留在很早以前，说明游戏根本没走到模组加载那一步^)
+echo     ^(这两个时间若停留在很早以前，说明游戏根本没走到模组加载那一步^)
 echo.
 pause
 goto menu
