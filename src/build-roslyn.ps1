@@ -1,4 +1,4 @@
-# build-roslyn.ps1 - compile GTA5Buddy.dll IN-PROCESS with the Roslyn compiler APIs.
+﻿# build-roslyn.ps1 - compile GTA5Buddy.dll IN-PROCESS with the Roslyn compiler APIs.
 #
 # Environment constraints this works around:
 #   * the sandbox currently denies spawning external processes, so build.ps1 (MSBuild)
@@ -24,19 +24,39 @@ $netRefs = 'C:\Program Files (x86)\Reference Assemblies\Microsoft\Framework\.NET
 foreach ($p in @($shvdn, $roslyn, $netRefs)) { if (-not (Test-Path $p)) { throw "missing prerequisite: $p" } }
 New-Item -ItemType Directory -Force -Path $outDir | Out-Null
 
-# Let Roslyn's dependencies (System.Collections.Immutable, System.Reflection.Metadata, ...)
-# resolve out of its own folder instead of failing the type initializer.
-$probeDirs = @($roslyn, (Split-Path $shvdn -Parent), $netRefs)
-$onResolve = [System.ResolveEventHandler] {
-    param($s, $e)
-    $simple = ($e.Name -split ',')[0]
-    foreach ($d in $probeDirs) {
-        $cand = Join-Path $d ($simple + '.dll')
-        if (Test-Path $cand) { return [System.Reflection.Assembly]::LoadFrom($cand) }
+# Load Roslyn's own dependencies EXPLICITLY, from the Roslyn folder, before touching Roslyn.
+#
+# 这里刻意**不用** AppDomain.AssemblyResolve 事件处理器 —— 那正是反复出问题的地方。
+#
+# 走过的弯路（两次都以 StackOverflowException 崩掉宿主进程，且**没有任何编译错误输出**，
+# 表现为"进程已终止"，极难定位）：
+#
+#   1) 处理器把 .NET **引用程序集**目录也当搜索路径。那里全是只有元数据、不能加载执行的
+#      程序集；一旦命中，LoadFrom 失败 -> .NET 再次触发 AssemblyResolve -> 又命中
+#      -> 无限递归 -> 栈溢出。
+#
+#   2) 换成用 HashSet 做重入保护。但事件处理器由 .NET 在自己的线程上调用，
+#      脚本作用域变量在那个上下文里取不到，守卫自身抛异常 -> .NET 重试 -> 又是递归。
+#
+# 正解：直接按名字把依赖 LoadFrom 进来。缺哪个就报明确的 FileNotFoundException，
+# 而不是一个没有任何线索的栈溢出。
+$roslynDeps = @(
+    'System.Runtime.CompilerServices.Unsafe.dll',
+    'System.Buffers.dll',
+    'System.Numerics.Vectors.dll',
+    'System.Memory.dll',
+    'System.Collections.Immutable.dll',
+    'System.Reflection.Metadata.dll',
+    'System.Text.Encoding.CodePages.dll',
+    'System.Threading.Tasks.Extensions.dll'
+)
+foreach ($depName in $roslynDeps) {
+    $dep = Join-Path $roslyn $depName
+    if (Test-Path $dep) {
+        try { [void][System.Reflection.Assembly]::LoadFrom($dep) }
+        catch { Write-Host ("  [warn] 无法预加载 {0}: {1}" -f $depName, $_.Exception.Message) -ForegroundColor DarkYellow }
     }
-    return $null
 }
-[System.AppDomain]::CurrentDomain.add_AssemblyResolve($onResolve)
 
 Write-Host ("PowerShell: {0}" -f $PSVersionTable.PSVersion) -ForegroundColor DarkGray
 

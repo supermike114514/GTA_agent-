@@ -71,6 +71,9 @@ namespace GTA5Buddy
         private string _escortLabel = "桑托劳 Zentorno";
         private bool _vehiclePickMode;   // true 时点载具是"选为队友座驾"而非刷出
 
+        /// <summary>特色开关：变形金刚模式（车辆会叠罗汉）。见 Companion.TransformerMode。</summary>
+        private NativeCheckboxItem _transformerItem;
+
         /// <summary>
         /// Model the companion starts with, and what "恢复默认外观" switches back to.
         /// Mirrors BuddyConfig.DefaultModel ("s_m_m_security_01").
@@ -742,6 +745,22 @@ namespace GTA5Buddy
             AddAction(_vehicles, "队友 · 全部坐进「" + _escortLabel + "」",
                       "一辆车坐满再开下一辆，遍历座位入座",
                       delegate { _squad.LoadIntoVehicles(_escortModel); });
+
+            // ---- 特色功能：变形金刚模式 --------------------------------------
+            //
+            // 调试直接驾驶时意外得到的效果：装甲车互相顶会叠成罗汉塔。
+            // 它是"车真的在动"的副作用，但确实有趣，所以作为独立开关保留，默认关闭。
+            _transformerItem = new NativeCheckboxItem("特色 · 变形金刚模式",
+                                                      "跳过间距与避障，车辆会互相攀爬叠起来",
+                                                      Companion.TransformerMode);
+            _transformerItem.CheckboxChanged += delegate
+            {
+                Companion.TransformerMode = _transformerItem.Checked;
+                Notify(Companion.TransformerMode
+                    ? "~b~变形金刚模式：开启（车辆会叠罗汉）"
+                    : "~b~变形金刚模式：关闭（正常沿路跟随）");
+            };
+            _vehicles.Add(_transformerItem);
 
             int shown = 0;
             foreach (VehiclePanel.Entry e in _vehicleData.VisibleEntries())

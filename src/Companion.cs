@@ -832,6 +832,19 @@ namespace GTA5Buddy
         private bool _escortDirectDrive;
         private int _escortStallSince;
 
+        /// <summary>
+        /// 变形金刚模式：保留最初的"直接推"行为。
+        ///
+        /// 那个行为会让装甲车互相顶、叠成罗汉塔（实测截图很欢乐），
+        /// 但它同时也是"车真的在动"的证明 —— 所以作为特色功能单独保留，默认关闭。
+        /// 开启后跳过间距与避障，车辆会互相攀爬叠起来。
+        /// </summary>
+        internal static bool TransformerMode { get; set; }
+
+        // 车载开火的节流与状态
+        private int _nextEscortCombat;
+        private bool _escortEngaging;
+
         /// <summary>True while the companion is driving its own car to keep up with the player.</summary>
         internal bool EscortMode { get { return _escortMode; } }
 
@@ -1240,20 +1253,60 @@ namespace GTA5Buddy
                     return;
                 }
 
-                Vector3 pos = car.Position;
+                // ---- 变形金刚模式：保留最初的粗暴推法（会叠罗汉，作为特色保留）----
+                if (TransformerMode)
+                {
+                    Vector3 tpos = car.Position;
+                    float tdesired = HeadingTo(tpos, player.Position);
+                    float tdelta = NormalizeAngle(tdesired - car.Heading);
+                    const float tTurn = 2.5f;
+                    if (tdelta > tTurn) tdelta = tTurn;
+                    if (tdelta < -tTurn) tdelta = -tTurn;
+                    car.Heading = Normalize360(car.Heading + tdelta);
 
-                // ---- 转向：朝玩家的方位，每次只转一点，避免车头瞬间跳变 ----
-                float desired = HeadingTo(pos, player.Position);
+                    car.ForwardSpeed = distance > 60.0f ? 30.0f : (distance > 25.0f ? 18.0f : 10.0f);
+
+                    if (Game.GameTime >= _nextEscortDiag)
+                    {
+                        _nextEscortDiag = Game.GameTime + 2000;
+                        BuddyLog.Info("escort[" + _squadIndex + "]: TRANSFORMER push  dist=" +
+                                      distance.ToString("0.0") + " vehSpeed=" +
+                                      car.Speed.ToString("0.0"));
+                    }
+                    return;
+                }
+
+                // ---- 避障：前方有别的车/人就刹车 ----------------------------
+                //
+                // 这是"叠罗汉"的直接成因：直接设 ForwardSpeed 绕过了引擎的碰撞规避，
+                // 几辆车互相顶就爬到一起了。前方有障碍时停下来即可根治。
+                // 另外每个队友的停车距离随编号递增，形成前后间距而不是挤成一团。
+                float keepClear = 7.0f + (_squadIndex * 1.5f);
+                if (IsBlockedAhead(car, keepClear))
+                {
+                    car.ForwardSpeed = 0.0f;
+                    return;
+                }
+
+                // ---- 目标点落在道路上 ----------------------------------------
+                //
+                // 不再直接朝玩家开（那会穿野地、撞墙）。改为：
+                //   从玩家位置朝本车方向退开一段 -> 得到一个"接近点"
+                //   把接近点吸附到最近的道路节点 -> 车就沿路开过去
+                Vector3 approach = ApproachPoint(car.Position, player.Position, 10.0f);
+                Vector3 roadTarget = SnapToRoad(approach);
+
+                float desired = HeadingTo(car.Position, roadTarget);
                 float delta = NormalizeAngle(desired - car.Heading);
 
-                const float maxTurnPerTick = 2.5f;
-                if (delta > maxTurnPerTick) delta = maxTurnPerTick;
-                if (delta < -maxTurnPerTick) delta = -maxTurnPerTick;
-
+                // 每次最多转 4°，且不会转过头
+                float maxTurn = Math.Min(4.0f, Math.Abs(delta));
+                if (delta != 0f) delta = Math.Sign(delta) * maxTurn;
                 car.Heading = Normalize360(car.Heading + delta);
 
-                // ---- 前进：离得越远开得越快 ----
-                float speed = distance > 60.0f ? 30.0f : (distance > 25.0f ? 18.0f : 10.0f);
+                // ---- 前进：离得越远开得越快；大角度转向时减速，避免原地打转 ----
+                float speed = distance > 60.0f ? 28.0f : (distance > 25.0f ? 16.0f : 9.0f);
+                if (Math.Abs(delta) > 45.0f) speed *= 0.35f;
                 car.ForwardSpeed = speed;
 
                 if (Game.GameTime >= _nextEscortDiag)
@@ -1267,6 +1320,147 @@ namespace GTA5Buddy
                 }
             }
             catch (Exception ex) { BuddyLog.Error("DirectDriveToward failed", ex); }
+        }
+
+        /// <summary>
+        /// 前方是否有障碍（别的载具或行人）。用于直接驾驶时的刹车判断，
+        /// 这是防止几辆车互相攀爬叠起来的关键。
+        /// </summary>
+        private static bool IsBlockedAhead(Vehicle car, float lookAhead)
+        {
+            try
+            {
+                Vector3 probe = car.Position + car.ForwardVector * lookAhead;
+
+                foreach (Vehicle v in World.GetNearbyVehicles(probe, 4.0f, null))
+                {
+                    if (v == null || !v.Exists() || v == car) continue;
+                    return true;
+                }
+
+                foreach (Ped p in World.GetNearbyPeds(probe, 2.5f, null))
+                {
+                    if (p == null || !p.Exists()) continue;
+                    Ped me = Game.Player.Character;
+                    if (me != null && p == me) continue;   // 玩家不算障碍
+                    return true;
+                }
+            }
+            catch (Exception) { }
+            return false;
+        }
+
+        /// <summary>
+        /// 玩家与本车之间、靠近玩家的一个点。直接朝玩家开会穿野地撞墙，
+        /// 用这个点再吸附到道路节点，就能沿路接近。
+        /// </summary>
+        private static Vector3 ApproachPoint(Vector3 carPos, Vector3 playerPos, float backOff)
+        {
+            Vector3 dir = carPos - playerPos;
+            float len = dir.Length();
+            if (len < 0.5f) return playerPos;
+            dir = dir * (1.0f / len);
+            return playerPos + dir * backOff;
+        }
+
+        /// <summary>把一个点吸附到最近的道路节点；失败时返回原点。</summary>
+        private static Vector3 SnapToRoad(Vector3 point)
+        {
+            try
+            {
+                var outPos = new OutputArgument();
+                bool ok = Function.Call<bool>(Hash.GET_CLOSEST_VEHICLE_NODE,
+                                              point.X, point.Y, point.Z,
+                                              outPos,
+                                              1,        // 1 = 只考虑道路节点
+                                              3.0f,     // 搜索半径
+                                              0f);
+                if (ok)
+                {
+                    Vector3 node = outPos.GetResult<Vector3>();
+                    // 道路节点有时会吸到高架/地下，Z 差太多就放弃吸附
+                    if (Math.Abs(node.Z - point.Z) < 8.0f) return node;
+                }
+            }
+            catch (Exception) { }
+            return point;
+        }
+
+        /// <summary>
+        /// 特种载具内开火。
+        ///
+        /// 场景：玩家遭到攻击时，坐在坦克/APC 里的队友应该用车载武器还击，
+        /// 而不是干坐着。判定分两种：
+        ///
+        ///   * 载具有车载武器（坦克的炮、APC 的重机枪等）
+        ///       -> SET_VEHICLE_SHOOT_AT_TARGET + TASK_VEHICLE_SHOOT_AT_PED，
+        ///          让炮塔/车载武器瞄准并射击
+        ///   * 普通载具（只能探身射击）
+        ///       -> 同样用 TASK_VEHICLE_SHOOT_AT_PED，引擎会处理成驾驶位射击
+        ///
+        /// 触发条件：玩家进入战斗，或队友自己已经锁定了敌人。
+        /// </summary>
+        private void UpdateEscortCombat(Ped player)
+        {
+            // 每 500ms 判一次即可，没必要每帧查
+            if (Game.GameTime < _nextEscortCombat) return;
+            _nextEscortCombat = Game.GameTime + 500;
+
+            try
+            {
+                if (_ped == null || !_ped.Exists() || !_ped.IsInVehicle()) return;
+
+                // 找目标：优先玩家正在交战的敌人，其次队友自己的威胁
+                Ped enemy = null;
+                try
+                {
+                    if (player != null && player.Exists() && player.IsInCombat)
+                    {
+                        enemy = FindThreat(player);
+                    }
+                }
+                catch (Exception) { }
+
+                if (enemy == null || !enemy.Exists() || enemy.IsDead)
+                {
+                    if (_threat != null && _threat.Exists() && !_threat.IsDead) enemy = _threat;
+                }
+
+                if (enemy == null || !enemy.Exists() || enemy.IsDead)
+                {
+                    _escortEngaging = false;
+                    return;
+                }
+
+                // 车载武器判定
+                var weaponOut = new OutputArgument();
+                bool hasVehicleWeapon = false;
+                try
+                {
+                    hasVehicleWeapon = Function.Call<bool>(Hash.GET_CURRENT_PED_VEHICLE_WEAPON,
+                                                           _ped, weaponOut);
+                }
+                catch (Exception) { }
+
+                if (hasVehicleWeapon)
+                {
+                    // 坦克炮塔 / APC 车载武器：直接瞄准目标开火
+                    Function.Call(Hash.SET_VEHICLE_SHOOT_AT_TARGET, _ped, enemy, 0f, 0f, 0f);
+                }
+
+                // 这一条对两种载具都适用：让驾驶员用车上的武器打目标
+                // p2 是射击精度相关的参数，给 1.0 表示尽量瞄准
+                Function.Call(Hash.TASK_VEHICLE_SHOOT_AT_PED, _ped, enemy, 1.0f);
+
+                if (!_escortEngaging)
+                {
+                    _escortEngaging = true;
+                    BuddyLog.Info("escort[" + _squadIndex + "]: engaging from vehicle, " +
+                                  "vehicleWeapon=" + hasVehicleWeapon +
+                                  " target=" + enemy.Handle);
+                }
+            }
+            catch (Exception ex) { BuddyLog.Error("UpdateEscortCombat failed", ex); }
         }
 
         /// <summary>
@@ -1488,6 +1682,7 @@ namespace GTA5Buddy
                 {
                     UpdateVehicleEscort(player);
                     GuardSurvival(player);
+                    UpdateEscortCombat(player);
                     if (ShowHud) _hud.Draw(_ped, "驾驶跟随");
                     return;
                 }
