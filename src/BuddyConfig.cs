@@ -32,6 +32,26 @@ namespace GTA5Buddy
         /// <summary>传送时落在玩家后方的距离（米）。</summary>
         internal const float EscortTeleportBehind = 16.0f;
 
+        /// <summary>
+        /// 小队成员之间的分离距离（米），交给引擎的编队算法使用。
+        ///
+        /// 这是"借 GTA 自带算法"的一部分：与其我自己算间距，不如把引擎的
+        /// SET_GROUP_SEPARATION_RANGE 调大，让引擎负责把成员拉开。
+        /// </summary>
+        internal const float GroupSeparationRange = 25.0f;
+
+        /// <summary>
+        /// 直接驾驶时每个队友的编队位距玩家的距离（米），按编号递增。
+        ///
+        /// 这是解决"车辆堆积"的关键：每辆车有**自己的目标位**，而不是都朝玩家开。
+        /// 都朝同一点开必然挤在一起；各有各的位置才会排成队列。
+        /// </summary>
+        internal const float ConvoySlotBase = 12.0f;
+        internal const float ConvoySlotStep = 7.0f;
+
+        /// <summary>进入自己的编队位多少米内就停车（米）。</summary>
+        internal const float ConvoySlotArrive = 7.0f;
+
         // ---- follow (L2/F1) ----
         internal const float FollowOffsetSide = 1.2f;   // + = to the buddy's right of the player
         internal const float FollowOffsetBack = -1.1f;  // - = behind the player

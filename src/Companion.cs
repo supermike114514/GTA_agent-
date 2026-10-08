@@ -439,6 +439,29 @@ namespace GTA5Buddy
             Function.Call(Hash.SET_PED_AS_GROUP_MEMBER, _ped, Function.Call<int>(Hash.GET_PED_GROUP_INDEX, player));
             Function.Call(Hash.SET_PED_NEVER_LEAVES_GROUP, _ped, true);
 
+            // ---- 借引擎自带的小队算法 --------------------------------------
+            //
+            // GTA 自己就有一套"小队跟随"的实现（游戏本体的小队任务用它），
+            // 比自己写驾驶逻辑可靠得多。这里把其中两个关键开关打开：
+            //
+            //   SET_GROUP_SEPARATION_RANGE        : 成员之间保持的间距。
+            //       调大之后引擎会主动把成员拉开 —— 这正是"车辆堆积"需要的。
+            //
+            //   SET_PED_CAN_TELEPORT_TO_GROUP_LEADER
+            //       : **引擎自己会把掉队的成员传送到队长身边**。
+            //         也就是说"玩家跑远了就把队友传过来"这件事，游戏本身就支持，
+            //         不需要我自己写传送逻辑（我前面手写的那套可以当作兜底）。
+            try
+            {
+                int group = Function.Call<int>(Hash.GET_PED_GROUP_INDEX, player);
+                if (group != 0)
+                {
+                    Function.Call(Hash.SET_GROUP_SEPARATION_RANGE, group, BuddyConfig.GroupSeparationRange);
+                    Function.Call(Hash.SET_PED_CAN_TELEPORT_TO_GROUP_LEADER, _ped, group, true);
+                }
+            }
+            catch (Exception ex) { BuddyLog.Error("group formation setup failed", ex); }
+
             _ped.RelationshipGroup = _group;
             _ped.SetConfigFlag(PedConfigFlagToggles.KeepRelationshipGroupAfterCleanUp, true);
             _ped.SetConfigFlag(PedConfigFlagToggles.TreatAsFriendlyForTargetingAndDamage, true);
@@ -1292,9 +1315,8 @@ namespace GTA5Buddy
 
                 // ---- 避障：前方有别的车/人就刹车 ----------------------------
                 //
-                // 这是"叠罗汉"的直接成因：直接设 ForwardSpeed 绕过了引擎的碰撞规避，
+                // 这是"叠罗汉/堆积"的直接成因：直接设 ForwardSpeed 绕过了引擎的碰撞规避，
                 // 几辆车互相顶就爬到一起了。前方有障碍时停下来即可根治。
-                // 另外每个队友的停车距离随编号递增，形成前后间距而不是挤成一团。
                 float keepClear = 7.0f + (_squadIndex * 1.5f);
                 if (IsBlockedAhead(car, keepClear))
                 {
@@ -1302,13 +1324,31 @@ namespace GTA5Buddy
                     return;
                 }
 
-                // ---- 目标点落在道路上 ----------------------------------------
+                // ---- 驶向**自己的编队位**，而不是玩家所在的那一点 ----------------
                 //
-                // 不再直接朝玩家开（那会穿野地、撞墙）。改为：
-                //   从玩家位置朝本车方向退开一段 -> 得到一个"接近点"
-                //   把接近点吸附到最近的道路节点 -> 车就沿路开过去
-                Vector3 approach = ApproachPoint(car.Position, player.Position, 10.0f);
-                Vector3 roadTarget = SnapToRoad(approach);
+                // 这是解决堆积的关键。原来所有车都朝玩家的位置开，必然挤在同一点、
+                // 互相顶、最后叠起来。改成每个队友有一个专属的停车位：
+                // 玩家正后方，距离按编号递增，横向三列错开，于是自然排成队列。
+                //
+                //   0 号：玩家后方 12 米，中间
+                //   1 号：玩家后方 19 米，偏左
+                //   2 号：玩家后方 26 米，偏右
+                //   ...
+                float slotBack = BuddyConfig.ConvoySlotBase + (_squadIndex * BuddyConfig.ConvoySlotStep);
+                int lane = (_squadIndex % 3) - 1;              // -1 / 0 / +1
+                Vector3 slot = player.Position
+                             - player.ForwardVector * slotBack
+                             + player.RightVector * (lane * 3.5f);
+
+                // 已经停进自己的位子就不再推它
+                if (car.Position.DistanceTo(slot) < BuddyConfig.ConvoySlotArrive)
+                {
+                    car.ForwardSpeed = 0.0f;
+                    return;
+                }
+
+                // 目标点吸附到路面，避免朝野地/建筑开
+                Vector3 roadTarget = SnapToRoad(slot);
 
                 float desired = HeadingTo(car.Position, roadTarget);
                 float delta = NormalizeAngle(desired - car.Heading);
@@ -1318,18 +1358,18 @@ namespace GTA5Buddy
                 if (delta != 0f) delta = Math.Sign(delta) * maxTurn;
                 car.Heading = Normalize360(car.Heading + delta);
 
-                // ---- 前进：离得越远开得越快；大角度转向时减速，避免原地打转 ----
-                float speed = distance > 60.0f ? 28.0f : (distance > 25.0f ? 16.0f : 9.0f);
+                // ---- 前进：离自己的位子越远开得越快；大角度转向时减速，避免原地打转 ----
+                float toSlot = car.Position.DistanceTo(slot);
+                float speed = toSlot > 60.0f ? 28.0f : (toSlot > 25.0f ? 16.0f : 9.0f);
                 if (Math.Abs(delta) > 45.0f) speed *= 0.35f;
                 car.ForwardSpeed = speed;
 
                 if (Game.GameTime >= _nextEscortDiag)
                 {
                     _nextEscortDiag = Game.GameTime + 2000;
-                    BuddyLog.Info("escort[" + _squadIndex + "]: DIRECT DRIVE  dist=" +
+                    BuddyLog.Info("escort[" + _squadIndex + "]: DIRECT DRIVE to slot  slotDist=" +
+                                  toSlot.ToString("0.0") + " playerDist=" +
                                   distance.ToString("0.0") + " speed=" + speed.ToString("0.0") +
-                                  " heading=" + car.Heading.ToString("0") +
-                                  " desired=" + desired.ToString("0") +
                                   " vehSpeed=" + car.Speed.ToString("0.0"));
                 }
             }
@@ -1339,25 +1379,36 @@ namespace GTA5Buddy
         /// <summary>
         /// 前方是否有障碍（别的载具或行人）。用于直接驾驶时的刹车判断，
         /// 这是防止几辆车互相攀爬叠起来的关键。
+        ///
+        /// 用 GetNearbyEntities 而不是 GetNearbyVehicles/GetNearbyPeds：
+        /// 后两者要多传一个 Model[] 参数，我之前传了 null，很可能每次都抛异常
+        /// （被 catch 吞掉后一律返回 false）——**避障就从来没有生效过**，
+        /// 这正是车辆堆积的直接原因。GetNearbyEntities 只需要位置和半径。
         /// </summary>
         private static bool IsBlockedAhead(Vehicle car, float lookAhead)
         {
             try
             {
                 Vector3 probe = car.Position + car.ForwardVector * lookAhead;
+                Ped me = Game.Player.Character;
 
-                foreach (Vehicle v in World.GetNearbyVehicles(probe, 4.0f, null))
+                foreach (Entity e in World.GetNearbyEntities(probe, 5.0f))
                 {
-                    if (v == null || !v.Exists() || v == car) continue;
-                    return true;
-                }
+                    if (e == null || !e.Exists()) continue;
 
-                foreach (Ped p in World.GetNearbyPeds(probe, 2.5f, null))
-                {
-                    if (p == null || !p.Exists()) continue;
-                    Ped me = Game.Player.Character;
-                    if (me != null && p == me) continue;   // 玩家不算障碍
-                    return true;
+                    var v = e as Vehicle;
+                    if (v != null)
+                    {
+                        if (v != car) return true;
+                        continue;
+                    }
+
+                    var p = e as Ped;
+                    if (p != null)
+                    {
+                        if (me != null && p == me) continue;   // 玩家不算障碍
+                        return true;
+                    }
                 }
             }
             catch (Exception) { }
