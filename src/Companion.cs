@@ -826,6 +826,7 @@ namespace GTA5Buddy
         private Model _escortModel;
         private int _escortRequestedAt;
         private int _nextEscortDiag;   // 诊断日志节流
+        private Vector3? _lastEscortPos;   // 上次下发任务时车的位置，用于算"动了多远"
 
         /// <summary>True while the companion is driving its own car to keep up with the player.</summary>
         internal bool EscortMode { get { return _escortMode; } }
@@ -870,7 +871,9 @@ namespace GTA5Buddy
                 _escortMode = true;
                 _escortRequestedAt = Game.GameTime;
                 _nextEscortTask = 0;
+                _lastEscortPos = null;
 
+                BuddyLog.Info("escort[" + _squadIndex + "]: order accepted, waiting for model");
                 Notify("~b~正在为队友准备座驾…");
             }
             catch (Exception ex) { BuddyLog.Error("OrderVehicleEscort failed", ex); }
@@ -1053,20 +1056,45 @@ namespace GTA5Buddy
                 bool stuck = _escortVehicle.Speed < 1.0f && distance > 12.0f;
 
                 if (!farBehind && !stuck && Game.GameTime < _nextEscortTask) return;
-                _nextEscortTask = Game.GameTime + (stuck ? 1200 : 2500);
+                _nextEscortTask = Game.GameTime + (stuck ? 1200 : 2200);
 
                 // 落后越远开得越快，避免永远追不上
                 float cruise = farBehind ? 35.0f : (_squadIndex == 0 ? 22.0f : 19.0f);
+                float stopRange = farBehind ? 18.0f : 12.0f;
 
-                // 跟随距离：0 号跟得最近，后面的依次拉开，形成梯队而不是挤成一团
-                int followDistance = 8 + (_squadIndex * 3);
+                // 目标点：玩家当前位置。刻意不再用"梯队偏移位"：
+                // 偏移位在玩家移动时会落在路边/建筑上，寻路会失败导致车不动。
+                Vector3 dest = player.Position;
 
-                _ped.Task.VehicleFollow(_escortVehicle, player, cruise, EscortDrivingFlags, followDistance);
+                // 用 TASK_VEHICLE_DRIVE_TO_COORD 而不是 VehicleFollow：
+                // 这个原生的每个参数我都能显式控制，便于按日志逐步收敛。
+                //
+                // 参数顺序（alloc8or 参考）：
+                //   ped, vehicle, x, y, z, speed, p6, vehicleModel, drivingMode, stopRange, p10
+                // p6 与 p10 按惯例都传 1.0。**之前我把 p6 传成 0**，
+                // 那会让任务无法正常建立 —— 很可能就是最初"车完全不动"的原因。
+                Function.Call(Hash.TASK_VEHICLE_DRIVE_TO_COORD,
+                              _ped, _escortVehicle,
+                              dest.X, dest.Y, dest.Z,
+                              cruise,
+                              1.0f,
+                              _escortVehicle.Model.Hash,
+                              (int)EscortDrivingFlags,
+                              stopRange,
+                              1.0f);
 
-                BuddyLog.Info("escort[" + _squadIndex + "]: issued follow task  dist=" +
+                // 位置追踪：下一次重发时能算出车实际移动了多远。
+                // 这样日志可以直接回答"车到底动没动"，不用再靠猜。
+                Vector3 now = _escortVehicle.Position;
+                float moved = _lastEscortPos.HasValue ? now.DistanceTo(_lastEscortPos.Value) : 0f;
+                _lastEscortPos = now;
+
+                BuddyLog.Info("escort[" + _squadIndex + "]: task issued  dist=" +
                               distance.ToString("0.0") + " speed=" + cruise.ToString("0.0") +
-                              " followDist=" + followDistance + " farBehind=" + farBehind +
-                              " stuck=" + stuck);
+                              " stopRange=" + stopRange.ToString("0.0") +
+                              " vehSpeed=" + _escortVehicle.Speed.ToString("0.0") +
+                              " movedSince=" + moved.ToString("0.0") +
+                              " farBehind=" + farBehind + " stuck=" + stuck);
             }
             catch (Exception ex) { BuddyLog.Error("UpdateVehicleEscort failed", ex); }
         }
