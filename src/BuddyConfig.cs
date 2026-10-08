@@ -36,6 +36,16 @@ namespace GTA5Buddy
         /// <summary>传送落点的最大允许距离（用户要求的 2 公里上限）。</summary>
         internal const float EscortTeleportMaxDistance = 2000.0f;
 
+        // ---- 近距离"跟不上"兜底（用户要求：以玩家位置移动）----
+        //
+        // 5 公里那一档太远，日常"跟不上"通常发生在几百米。
+        // 所以再加一档更实用的：车卡住不动、且已经落后 200 米以上时，
+        // 直接把它挪到玩家后方约 60 米的路面上。
+        internal const float EscortCloseTeleportBeyond = 200.0f;
+        internal const float EscortCloseTeleportBehind = 60.0f;
+        internal const int EscortCloseTeleportStalledMs = 6000;
+        internal const int EscortCloseTeleportCooldownMs = 15000;
+
         /// <summary>
         /// 小队成员之间的分离距离（米），交给引擎的编队算法使用。
         ///

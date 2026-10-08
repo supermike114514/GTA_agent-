@@ -869,6 +869,9 @@ namespace GTA5Buddy
 
         // 队友组当前是否与警察敌对（跟随玩家的通缉等级）
         private bool _copHostile;
+
+        // 乘车战斗是否已准备过（武器 + 属性只设一次，反复设置会打断驾驶任务）
+        private bool _vehicleCombatReady;
         private int _nextRelationSync;   // 关系表同步节流
 
         /// <summary>
@@ -1257,6 +1260,25 @@ namespace GTA5Buddy
                     return;
                 }
 
+                // ---- 近距离"跟不上"兜底：以玩家位置为准挪过来 --------------------
+                //
+                // 用户明确要求"把 agent 车辆以玩家实体的位置移动"。
+                // 5 公里那档太远，日常跟不上通常发生在几百米，所以这里加一档：
+                //
+                //   车卡住不动超过 6 秒 且 落后玩家 200 米以上  ->  挪到玩家后方 60 米
+                //
+                // 冷却 15 秒，避免反复传送（这个毛病之前出现过）。
+                if (distance > BuddyConfig.EscortCloseTeleportBeyond &&
+                    stalled &&
+                    Game.GameTime - _escortStallSince >= BuddyConfig.EscortCloseTeleportStalledMs &&
+                    Game.GameTime - _lastEscortTeleport >= BuddyConfig.EscortCloseTeleportCooldownMs)
+                {
+                    TeleportEscortClose(player, distance);
+                    _lastEscortTeleport = Game.GameTime;
+                    _escortStallSince = 0;
+                    return;
+                }
+
                 // 任务已存在、而且车没卡住 —— 什么都不要做，别去打断它
                 if (taskPresent && !stalled) return;
 
@@ -1345,10 +1367,26 @@ namespace GTA5Buddy
                 }
                 catch (Exception) { }
 
-                int wantMission;
-                if (enemy != null) wantMission = (int)VehicleMissionType.Attack;          // 6
-                else if (playerCar != null) wantMission = (int)VehicleMissionType.EscortRear;  // 12
-                else wantMission = (int)VehicleMissionType.Follow;                        // 7
+                // ---- 驾驶任务永远是"跟随"，**不用 Attack** ------------------
+                //
+                // 这是重要的架构修正。"有敌人就切 Attack"看起来合理，实测却是灾难：
+                //
+                //   issued ATTACK      176 次
+                //   issued ESCORT_REAR  27 次
+                //   速度平均 2.75，大部分时间为 0
+                //
+                // 原因是 **Attack 任务会让车停下来交战** —— 有敌人时它就一直不跟随，
+                // 车队钉在原地。
+                //
+                // 正确架构（也正是用户要求的"以玩家位置移动，同时保持开火能力"）：
+                //   * 驾驶层：**永远只做跟随**（EscortRear / Follow），车一直在动
+                //   * 战斗层：独立叠加，**不替换驾驶任务**
+                //       - 战斗属性让引擎的战斗 AI 自行开火，驾驶任务照常跑
+                //       - 车载武器用 SET_VEHICLE_SHOOT_AT_TARGET 转炮塔（独立一层）
+                //       - 乘客用 TASK_DRIVE_BY（乘客没有驾驶任务，不冲突）
+                int wantMission = (playerCar != null)
+                    ? (int)VehicleMissionType.EscortRear     // 12
+                    : (int)VehicleMissionType.Follow;        // 7
 
                 // 意图没变、任务还在、车也没卡住 —— 什么都不做，别去打断引擎
                 if (wantMission == _currentMission && taskPresent && !stalled) return;
@@ -1362,23 +1400,7 @@ namespace GTA5Buddy
                 float cruise = distance > 45.0f ? 38.0f : (_squadIndex == 0 ? 26.0f : 22.0f);
                 string kind;
 
-                if (enemy != null)
-                {
-                    // ---- Attack(6)：目标是人 ----
-                    //
-                    // p6 = 到达判定距离，p7 = 直线段距离（不能给 0，否则会直冲）
-                    // p8 = true 表示允许离开道路追击
-                    Function.Call(Hash.TASK_VEHICLE_MISSION_PED_TARGET,
-                                  _ped, _escortVehicle, enemy,
-                                  (int)VehicleMissionType.Attack,
-                                  cruise,
-                                  (int)EscortDrivingFlags,
-                                  8.0f,      // 靠到这个距离就算咬住
-                                  8.0f,
-                                  true);     // 允许脱离道路
-                    kind = "ATTACK";
-                }
-                else if (playerCar != null)
+                if (playerCar != null)
                 {
                     // ---- EscortRear(-1 / 12)：跟在那辆车后方 ----
                     //
@@ -1879,6 +1901,41 @@ namespace GTA5Buddy
         }
 
         /// <summary>
+        /// 近距离"跟不上"兜底：把队友连车挪到玩家后方约 60 米的路面。
+        ///
+        /// 这是用户要求的"以玩家实体位置移动"的实用档。相比 5 公里那一档，
+        /// 它对付的是日常的"卡在路口/墙后跟丢了"。
+        /// 由调用方负责冷却（EscortCloseTeleportCooldownMs）。
+        /// </summary>
+        private void TeleportEscortClose(Ped player, float distance)
+        {
+            try
+            {
+                if (_escortVehicle == null || !_escortVehicle.Exists()) return;
+
+                // 落在玩家后方（沿玩家朝向），并吸附到路面
+                Vector3 behind = player.Position
+                               - player.ForwardVector * BuddyConfig.EscortCloseTeleportBehind;
+                Vector3 spot = SnapToRoad(behind);
+
+                _escortVehicle.Position = spot;
+                _escortVehicle.PlaceOnGround();
+                _escortVehicle.IsEngineRunning = true;
+
+                Function.Call(Hash.SET_PED_INTO_VEHICLE, _ped, _escortVehicle, (int)VehicleSeat.Driver);
+
+                _lastEscortPos = null;
+                _currentMission = -1;      // 下次重新下发任务，让引擎在新位置重新规划
+
+                BuddyLog.Info("escort[" + _squadIndex + "]: CLOSE TELEPORT (was " +
+                              distance.ToString("0") + "m away, stuck) -> landed " +
+                              _escortVehicle.Position.DistanceTo(player.Position).ToString("0") +
+                              "m from player");
+            }
+            catch (Exception ex) { BuddyLog.Error("TeleportEscortClose failed", ex); }
+        }
+
+        /// <summary>
         /// 硬兜底：把队友连人带车传送到离玩家约 1.8 公里外的公路上。
         ///
         /// 触发条件是玩家已经跑出 <see cref="BuddyConfig.EscortTeleportBeyond"/> 米（5 公里）。
@@ -2204,6 +2261,7 @@ namespace GTA5Buddy
                 _escortClearedOnce = false;
                 _escortDirectDrive = false;
                 _lastEscortPos = null;
+                _vehicleCombatReady = false;   // 重新武装：武器与战斗属性再设一次
 
                 _state = BuddyState.InVehicle;
 
@@ -2273,7 +2331,6 @@ namespace GTA5Buddy
 
                 Function.Call(Hash.SET_PED_INTO_VEHICLE, _ped, car, chosen);
                 KeepPedInVehicle();
-                PrepareVehicleCombat();   // 换单手武器 + 战斗属性，否则车内无法还击
                 return true;
             }
             catch (Exception) { return false; }
@@ -2435,35 +2492,55 @@ namespace GTA5Buddy
             {
                 if (_ped == null || !_ped.Exists()) return;
 
-                // ---- 1. 换单手武器（能在车内使用）----
-                Hash current = Function.Call<Hash>(Hash.GET_BEST_PED_WEAPON, _ped, false);
-                bool alreadyOneHanded = current == (Hash)(uint)WeaponHash.MicroSMG ||
-                                        current == (Hash)(uint)WeaponHash.APPistol ||
-                                        current == (Hash)(uint)WeaponHash.Pistol ||
-                                        current == (Hash)(uint)WeaponHash.CombatPistol;
+                // 只做一次。**不能反复做** —— 上一版把它挂在座位锁的路径上，
+                // 结果日志里 "switched to a one-handed weapon" 出现了 **1189 次**，
+                // 而且每次发武器都会干扰 ped 的脚本任务（驾驶/射击被反复打断）。
+                if (_vehicleCombatReady && _ped.IsInVehicle()) return;
+                _vehicleCombatReady = true;
 
-                if (!alreadyOneHanded)
+                // ---- 1. 换单手武器（能在车内使用）----
+                //
+                // 用 GET_SELECTED_PED_WEAPON（**当前装备的**），不是 GET_BEST_PED_WEAPON。
+                // 上一版用了后者：它返回"最好"的武器，队友身上有步枪时永远返回步枪，
+                // 于是"是否单手武器"的判定永远失败 -> 每次都重新发一把 -> 1189 次循环。
+                Hash current = 0;
+                try { current = Function.Call<Hash>(Hash.GET_SELECTED_PED_WEAPON, _ped); }
+                catch (Exception) { }
+
+                Hash smg = (Hash)(uint)WeaponHash.MicroSMG;
+                bool oneHanded = current == smg ||
+                                 current == (Hash)(uint)WeaponHash.APPistol ||
+                                 current == (Hash)(uint)WeaponHash.Pistol ||
+                                 current == (Hash)(uint)WeaponHash.CombatPistol ||
+                                 current == (Hash)(uint)WeaponHash.SawnOffShotgun;
+
+                if (!oneHanded)
                 {
-                    Function.Call(Hash.GIVE_WEAPON_TO_PED, _ped,
-                                  (Hash)(uint)WeaponHash.MicroSMG, 9999, false, true);
-                    Function.Call(Hash.SET_PED_INFINITE_AMMO, _ped, true,
-                                  (Hash)(uint)WeaponHash.MicroSMG);
+                    Function.Call(Hash.GIVE_WEAPON_TO_PED, _ped, smg, 9999, false, true);
+                    // 明确**装备**它 —— 只给不装备的话，ped 手里还是原来那把长武器，
+                    // 引擎依然会因为"武器不能在车内使用"而想让他下车。
+                    Function.Call(Hash.SET_CURRENT_PED_WEAPON, _ped, smg, true);
+                    Function.Call(Hash.SET_PED_INFINITE_AMMO, _ped, true, smg);
+
                     BuddyLog.Info("escort[" + _squadIndex +
-                                  "]: switched to a one-handed weapon for in-vehicle use");
+                                  "]: equipped one-handed weapon for in-vehicle use");
                 }
 
-                // ---- 2. 战斗属性：让引擎的战斗 AI 能接管 ----
-                //   5  = AlwaysFight（见到敌人就打，不等被攻击）
+                // ---- 2. 战斗属性：让引擎的战斗 AI 能自行开火 ----
+                //
+                // 这是"边跟随边开火"的关键：战斗交给引擎的战斗 AI，
+                // **不去替换驾驶任务**，所以车照常跟着玩家跑。
+                //   5  = AlwaysFight
                 //   46 = CanFightArmedPedsWhenNotArmed
                 //   1  = CanUseVehicles
                 Function.Call(Hash.SET_PED_COMBAT_ATTRIBUTES, _ped, 5, true);
                 Function.Call(Hash.SET_PED_COMBAT_ATTRIBUTES, _ped, 46, true);
                 Function.Call(Hash.SET_PED_COMBAT_ATTRIBUTES, _ped, 1, true);
 
-                Function.Call(Hash.SET_PED_COMBAT_ABILITY, _ped, 2);   // 2 = 专业水平
-                Function.Call(Hash.SET_PED_COMBAT_RANGE, _ped, 2);     // 2 = 远距离
+                Function.Call(Hash.SET_PED_COMBAT_ABILITY, _ped, 2);
+                Function.Call(Hash.SET_PED_COMBAT_RANGE, _ped, 2);
                 Function.Call(Hash.SET_PED_ACCURACY, _ped, 55);
-                Function.Call(Hash.SET_PED_ALERTNESS, _ped, 3);        // 3 = 最高警觉
+                Function.Call(Hash.SET_PED_ALERTNESS, _ped, 3);
             }
             catch (Exception ex) { BuddyLog.Error("PrepareVehicleCombat failed", ex); }
         }
