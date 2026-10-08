@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using GTA;
 
@@ -17,6 +17,20 @@ namespace GTA5Buddy
         /// <summary>DefaultModel 的枚举形式，避免每次生成都做字符串到哈希的转换。</summary>
         internal const PedHash DefaultPedHash = PedHash.Security01SMM;
         internal const float SpawnDistance = 3.0f;
+
+        // ---- 队友自驾跟随的硬参数 ----
+        //
+        // 超过这个距离就直接把"队友 + 他的车"一起传送到玩家附近的路面上。
+        //
+        // 这是最可靠的兜底：引擎的驾驶 AI 对履带车/特种载具经常拒绝执行，
+        // 而直接控制又容易让几辆车互相顶、堆在一起。与其在几十米外挣扎，
+        // 不如超过阈值就直接挪过来。
+        //
+        // 给得较大，正常跟得上时不会触发；实测"跟不上"通常发生在 60 米以上。
+        internal const float EscortTeleportBeyond = 110.0f;
+
+        /// <summary>传送时落在玩家后方的距离（米）。</summary>
+        internal const float EscortTeleportBehind = 16.0f;
 
         // ---- follow (L2/F1) ----
         internal const float FollowOffsetSide = 1.2f;   // + = to the buddy's right of the player

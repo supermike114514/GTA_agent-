@@ -990,6 +990,9 @@ namespace GTA5Buddy
                 _lastEscortPos = null;
                 _nextEscortTask = 0;
 
+                // 解除"必须待在车里"，恢复正常的 AI 反应
+                ReleasePedVehicleLock();
+
                 if (_escortVehicle != null && _escortVehicle.Exists())
                 {
                     if (_ped != null && _ped.Exists() && _ped.IsInVehicle())
@@ -1084,37 +1087,48 @@ namespace GTA5Buddy
 
                 float distance = _escortVehicle.Position.DistanceTo(player.Position);
 
-                // ---- 任务是否仍在运行 ----------------------------------------
+                // ---- 任务是否仍然存在（**不是**"是否正在执行"）------------------
                 //
-                // 这是本功能之前一直失败的核心原因：
+                // 这是本功能之前一直失败的核心原因，日志给出了铁证：
                 //
-                //   TASK_* 原生是**替换型**的 —— 调用它会替换掉 ped 当前的脚本任务。
-                //   我原来每隔 1.2~2.2 秒无条件重发一次驾驶任务，等于不断地把车
-                //   "刚开始执行的路线规划"重置掉，车永远跑不过两秒就被打断，
-                //   表现就是停在原地。
+                //   issued 行里的 status 分布：Dormant x1271 / Performing x664 / Vacant x17
                 //
-                // 正确做法：持续型任务只需下发一次，之后由引擎自己维持跟随关系；
-                // 只有任务确实结束了才需要重新下发。
+                //   Dormant 表示"任务已分配但尚未激活"，对载具任务来说是很常见的中间态。
+                //   我原来只把 Performing / WaitingToStart 当作"任务在跑"，于是 Dormant 时
+                //   判定为"没任务" -> 重发 -> **每次重发都替换掉原任务** -> 永远停在 Dormant。
+                //   实测因此重发了 1952 次，车速有一半时间是 0。
+                //
+                // 正确判定：Performing / WaitingToStart / Dormant 都算"任务已存在，别动它"。
                 ScriptTaskStatus status = _ped.CurrentScriptTaskStatus;
-                bool taskRunning = status == ScriptTaskStatus.Performing ||
-                                   status == ScriptTaskStatus.WaitingToStart;
+                bool taskPresent = status == ScriptTaskStatus.Performing ||
+                                   status == ScriptTaskStatus.WaitingToStart ||
+                                   status == ScriptTaskStatus.Dormant;
 
-                // 位移追踪：用来判断"任务在跑但车没动"（卡住）这种例外情况。
+                // 位移追踪：用来判断"任务在、车却没动"（卡住）这种例外情况。
                 Vector3 now = _escortVehicle.Position;
                 float moved = _lastEscortPos.HasValue ? now.DistanceTo(_lastEscortPos.Value) : 0f;
                 _lastEscortPos = now;
 
                 bool stalled = _escortVehicle.Speed < 1.0f && distance > 15.0f;
 
+                // ---- 硬参数：玩家跑远了就把队友连车一起传送过来 ------------------
+                //
+                // 用户明确要求的兜底，也是最有保证的做法：与其让 AI 或直接控制在几十米外
+                // 挣扎（还会互相堆积），不如超过阈值就干脆把人车一起挪到玩家附近的路面上。
+                // 阈值给得较大，正常跟得上时不会触发。
+                if (distance > BuddyConfig.EscortTeleportBeyond)
+                {
+                    TeleportEscortNear(player, distance);
+                    return;
+                }
+
                 // ---- 卡住检测 → 自动切到"直接驾驶" ----------------------------
                 //
                 // 引擎的驾驶 AI 对**履带车/特种载具**（坦克 Rhino、Khanjali、APC、
-                // HalfTrack 等）经常拒绝正常执行：任务下发成功、状态是 Performing，
-                // 但车就是不动。这类车用任何 TASK_VEHICLE_* 都救不回来。
+                // HalfTrack 等）经常拒绝正常执行：任务下发成功、状态也正常，但车就是不动。
                 //
-                // 所以这里做兜底：任务在跑却持续不动超过 5 秒，就改用**直接控制**
-                // （自己给前进速度和转向），完全绕过引擎驾驶 AI。
-                // 这条路径对任何有 ForwardSpeed 的载具都有效。
+                // 这类车用任何 TASK_VEHICLE_* 都救不回来，所以兜底：持续不动超过 5 秒就
+                // 改用**直接控制**（自己给前进速度和转向），完全绕过引擎驾驶 AI。
                 if (stalled)
                 {
                     if (_escortStallSince == 0) _escortStallSince = Game.GameTime;
@@ -1141,13 +1155,13 @@ namespace GTA5Buddy
                     return;
                 }
 
-                // 任务在正常跑、而且车没卡住 —— 什么都不要做，别去打断它
-                if (taskRunning && !stalled) return;
+                // 任务已存在、而且车没卡住 —— 什么都不要做，别去打断它
+                if (taskPresent && !stalled) return;
 
                 // 卡住时给它一段观察期再重发，避免频繁重置
-                if (taskRunning && stalled && Game.GameTime < _nextEscortTask) return;
+                if (taskPresent && stalled && Game.GameTime < _nextEscortTask) return;
 
-                _nextEscortTask = Game.GameTime + (taskRunning ? 4000 : 0);
+                _nextEscortTask = Game.GameTime + (taskPresent ? 4000 : 0);
 
                 float cruise = distance > 45.0f ? 35.0f : (_squadIndex == 0 ? 22.0f : 19.0f);
                 string kind;
@@ -1215,7 +1229,7 @@ namespace GTA5Buddy
                 }
 
                 BuddyLog.Info("escort[" + _squadIndex + "]: issued " + kind +
-                              "  wasRunning=" + taskRunning + " status=" + status +
+                              "  wasRunning=" + taskPresent + " status=" + status +
                               " dist=" + distance.ToString("0.0") +
                               " cruise=" + cruise.ToString("0.0") +
                               " vehSpeed=" + _escortVehicle.Speed.ToString("0.0") +
@@ -1464,6 +1478,40 @@ namespace GTA5Buddy
         }
 
         /// <summary>
+        /// 硬兜底：把队友连人带车传送到玩家附近的路面上。
+        ///
+        /// 触发条件是玩家已经跑出 <see cref="BuddyConfig.EscortTeleportBeyond"/> 米。
+        /// 这是用户明确要求的"硬参数"，也是最有保证的跟随方式：
+        /// 引擎驾驶 AI 对履带/特种载具经常失效，直接控制又容易造成车辆堆积，
+        /// 所以在远距离上直接传送比继续挣扎可靠得多。
+        /// </summary>
+        private void TeleportEscortNear(Ped player, float distance)
+        {
+            try
+            {
+                if (_escortVehicle == null || !_escortVehicle.Exists()) return;
+
+                // 落在玩家后方，并吸附到路面，避免传进建筑或墙里
+                Vector3 behind = player.Position - player.ForwardVector * BuddyConfig.EscortTeleportBehind;
+                Vector3 spot = SnapToRoad(behind);
+
+                _escortVehicle.Position = spot;
+                _escortVehicle.PlaceOnGround();
+                _escortVehicle.IsEngineRunning = true;
+
+                // 司机必须留在驾驶位；传送会把 ped 甩出车外的情况一并处理
+                Function.Call(Hash.SET_PED_INTO_VEHICLE, _ped, _escortVehicle, (int)VehicleSeat.Driver);
+
+                _lastEscortPos = null;
+                _escortStallSince = 0;
+
+                BuddyLog.Info("escort[" + _squadIndex + "]: TELEPORTED to player (was " +
+                              distance.ToString("0") + "m away)");
+            }
+            catch (Exception ex) { BuddyLog.Error("TeleportEscortNear failed", ex); }
+        }
+
+        /// <summary>
         /// 世界坐标下的朝向角。GTA 约定：0=北，逆时针增大（90=西，180=南，270=东）。
         /// 推导：朝北 (dx=0, dy=1) 应为 0；朝西 (dx=-1, dy=0) 应为 90。
         /// 因此 heading = atan2(-dx, dy)。
@@ -1627,12 +1675,64 @@ namespace GTA5Buddy
                     _nextEscortTask = 0;
                     Function.Call(Hash.SET_DRIVER_ABILITY, _ped, 1.0f);
                     Function.Call(Hash.SET_DRIVER_AGGRESSIVENESS, _ped, 0.5f);
+
+                    KeepPedInVehicle();
                 }
 
                 BuddyLog.Info("vehicle: agent " + _squadIndex + " -> seat " + (int)seat +
                               (seat == VehicleSeat.Driver ? " (driver, escort armed)" : " (passenger)"));
             }
             catch (Exception ex) { BuddyLog.Error("WarpIntoVehicle failed", ex); }
+        }
+
+        /// <summary>
+        /// 让这一位老老实实待在车里。
+        ///
+        /// 实测队友会自己跑下车（日志里 175 次 "re-seated driver"）：原因是他们同时
+        /// 是玩家小队成员，**小队 AI 会让他们下车徒步跟随玩家**，和我们的驾驶任务打架。
+        ///
+        /// 用一层配置标志把"下车"这条路堵住：
+        ///
+        ///   DontLeaveVehicleIfLeaderNotInVehicle : 队长不在车上时不许下车（关键的一条）
+        ///   DontDragMeOutCar / StayInCarOnJack   : 不被拽下车
+        ///   BlockNonTemporaryEvents              : 不让 AI 事件打断已下发的任务
+        ///
+        /// BlockNonTemporaryEvents 只在自驾跟随时开，其它状态（步行战斗）要关掉，
+        /// 否则队友不会对战斗做出反应。
+        /// </summary>
+        private void KeepPedInVehicle()
+        {
+            try
+            {
+                if (_ped == null || !_ped.Exists()) return;
+
+                Function.Call(Hash.SET_BLOCKING_OF_NON_TEMPORARY_EVENTS, _ped, true);
+                Function.Call(Hash.SET_PED_CAN_BE_DRAGGED_OUT, _ped, false);
+                Function.Call(Hash.SET_PED_STAY_IN_VEHICLE_WHEN_JACKED, _ped, true);
+
+                _ped.SetConfigFlag(PedConfigFlagToggles.DontLeaveVehicleIfLeaderNotInVehicle, true);
+                _ped.SetConfigFlag(PedConfigFlagToggles.DontDragMeOutCar, true);
+                _ped.SetConfigFlag(PedConfigFlagToggles.StayInCarOnJack, true);
+            }
+            catch (Exception ex) { BuddyLog.Error("KeepPedInVehicle failed", ex); }
+        }
+
+        /// <summary>解除"必须待在车里"的限制，恢复正常的 AI 反应。</summary>
+        private void ReleasePedVehicleLock()
+        {
+            try
+            {
+                if (_ped == null || !_ped.Exists()) return;
+
+                Function.Call(Hash.SET_BLOCKING_OF_NON_TEMPORARY_EVENTS, _ped, false);
+                Function.Call(Hash.SET_PED_CAN_BE_DRAGGED_OUT, _ped, true);
+                Function.Call(Hash.SET_PED_STAY_IN_VEHICLE_WHEN_JACKED, _ped, false);
+
+                _ped.SetConfigFlag(PedConfigFlagToggles.DontLeaveVehicleIfLeaderNotInVehicle, false);
+                _ped.SetConfigFlag(PedConfigFlagToggles.DontDragMeOutCar, false);
+                _ped.SetConfigFlag(PedConfigFlagToggles.StayInCarOnJack, false);
+            }
+            catch (Exception) { }
         }
 
         /// <summary>
