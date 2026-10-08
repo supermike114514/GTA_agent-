@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using GTA;
 using GTA.Math;
@@ -820,6 +820,12 @@ namespace GTA5Buddy
         private bool _escortMode;
         private int _nextEscortTask;
 
+        // 待生成的座驾。命令只发起模型请求，真正的生成放到 tick 里做，
+        // 这样菜单回调不会因为等待模型加载而中断 LemonUI 的处理流程。
+        private bool _escortPending;
+        private Model _escortModel;
+        private int _escortRequestedAt;
+
         /// <summary>True while the companion is driving its own car to keep up with the player.</summary>
         internal bool EscortMode { get { return _escortMode; } }
 
@@ -837,33 +843,79 @@ namespace GTA5Buddy
                 Ped player = Game.Player.Character;
                 if (player == null || !player.Exists()) return;
 
-                // If a buddy car already exists, reuse it rather than littering the map.
+                // 已经有车就直接恢复跟随模式，不再生成第二辆
                 if (_escortVehicle != null && _escortVehicle.Exists() && !_escortVehicle.IsDead)
                 {
                     _escortMode = true;
+                    _escortPending = false;
                     _nextEscortTask = 0;
                     Notify("~g~队友已开始驾驶跟随");
                     return;
                 }
 
-                Model carModel = new Model(model);
+                var carModel = new Model(model);
                 if (!carModel.IsValid) { Notify("~r~载具模型不可用"); return; }
 
+                // 只发起请求，不在这一帧等它加载完。
+                //
+                // 这里原来是 while(!IsLoaded) Script.Yield()，但这个方法是在 LemonUI 的
+                // item.Activated 回调里被调用的 —— 在菜单的事件处理中间让出帧会把
+                // LemonUI 的处理流程打断，多队友时表现就是"只有最近的那个生效"。
+                // 现在改成记录请求，由 UpdateVehicleEscort 在正常的 tick 里完成生成。
                 carModel.Request(1000);
-                int waited = 0;
-                while (!carModel.IsLoaded && waited < 4000)
-                {
-                    Script.Yield();
-                    waited += 50;
-                }
-                if (!carModel.IsLoaded) { Notify("~r~载具模型加载超时"); return; }
 
-                Vector3 pos = player.Position + player.ForwardVector * 8.0f;
+                _escortModel = carModel;
+                _escortPending = true;
+                _escortMode = true;
+                _escortRequestedAt = Game.GameTime;
+                _nextEscortTask = 0;
+
+                Notify("~b~正在为队友准备座驾…");
+            }
+            catch (Exception ex) { BuddyLog.Error("OrderVehicleEscort failed", ex); }
+        }
+
+        /// <summary>待生成的座驾：模型加载完成后由 tick 创建，避免在菜单回调里阻塞。</summary>
+        private void UpdateEscortSpawn(Ped player)
+        {
+            if (!_escortPending) return;
+
+            try
+            {
+                if (!_escortModel.IsLoaded)
+                {
+                    // 超时保护：模型可能在本安装中缺失
+                    if (Game.GameTime - _escortRequestedAt > 10000)
+                    {
+                        _escortPending = false;
+                        _escortMode = false;
+                        Notify("~r~座驾模型加载超时");
+                    }
+                    return;
+                }
+
+                _escortPending = false;
+
+                // 每个队友的车在**不同位置**生成。原来所有队友都用 player+前向*8，
+                // 几辆车生成在同一点会互相顶住，结果只有一辆能开出去。
+                int slot = _squadIndex;
+                float side = ((slot % 3) - 1) * 4.5f;            // -4.5 / 0 / +4.5 三列
+                float back = 8.0f + ((slot / 3) * 5.5f);         // 每三辆往后错一排
+
+                Vector3 pos = player.Position
+                            + player.ForwardVector * back
+                            + player.RightVector * side;
+
                 float groundZ;
                 if (World.GetGroundHeight(pos, out groundZ)) pos = new Vector3(pos.X, pos.Y, groundZ + 0.5f);
 
-                Vehicle car = World.CreateVehicle(carModel, pos, player.Heading);
-                if (car == null || !car.Exists()) { Notify("~r~生成载具失败"); return; }
+                Vehicle car = World.CreateVehicle(_escortModel, pos, player.Heading);
+                if (car == null || !car.Exists())
+                {
+                    _escortMode = false;
+                    Notify("~r~生成载具失败");
+                    return;
+                }
 
                 car.IsPersistent = true;
                 car.PlaceOnGround();
@@ -875,13 +927,18 @@ namespace GTA5Buddy
                 Function.Call(Hash.SET_DRIVER_AGGRESSIVENESS, _ped, 0.5f);
 
                 _escortVehicle = car;
-                _escortMode = true;
-                _nextEscortTask = 0;
                 _state = BuddyState.InVehicle;
-                Notify("~g~已为队友生成载具，他会开车跟随你");
-                BuddyLog.Info("order: companion vehicle escort started, model=" + model);
+                _nextEscortTask = 0;
+
+                Notify("~g~队友 " + (_squadIndex + 1) + " 号已就车，开始跟随");
+                BuddyLog.Info("escort: agent " + _squadIndex + " got vehicle at slot " + slot);
             }
-            catch (Exception ex) { BuddyLog.Error("OrderVehicleEscort failed", ex); }
+            catch (Exception ex)
+            {
+                _escortPending = false;
+                _escortMode = false;
+                BuddyLog.Error("UpdateEscortSpawn failed", ex);
+            }
         }
 
         /// <summary>Stops the companion's own-car escort and removes that car.</summary>
@@ -890,6 +947,7 @@ namespace GTA5Buddy
             try
             {
                 _escortMode = false;
+                _escortPending = false;      // 取消还没生成完的座驾请求
                 _nextEscortTask = 0;
 
                 if (_escortVehicle != null && _escortVehicle.Exists())
@@ -908,25 +966,42 @@ namespace GTA5Buddy
         }
 
         /// <summary>
+        /// 驾驶跟随的标志位。
+        ///
+        /// 关键是这两个（默认的 Normal=786603 里**没有**它们，这正是车不走道路的原因）：
+        ///
+        ///   PreferNavmeshRoute              —— 优先走道路网路径
+        ///   UseWanderFallbackInsteadOfStraightLine
+        ///                                   —— 寻路失败时沿路绕行，而不是朝目标直冲
+        ///
+        /// 其余位保持"遵守交通、避让行人车辆"的常规行为。
+        /// </summary>
+        private const VehicleDrivingFlags EscortDrivingFlags =
+            VehicleDrivingFlags.DrivingModeStopForVehicles
+            | VehicleDrivingFlags.PreferNavmeshRoute
+            | VehicleDrivingFlags.UseWanderFallbackInsteadOfStraightLine;
+
+        /// <summary>
         /// Per-tick upkeep for escort mode.
         ///
-        /// 三个要点（都是实测反馈出来的问题）：
-        ///
-        ///   1. 走**道路网**而不是直线。原来用 TASK_VEHICLE_DRIVE_TO_COORD，它会让车
-        ///      朝目标点直线开（撞墙、抄野地）。改用 _LONGRANGE 变体，引擎会自己规划
-        ///      路网路径。
-        ///
-        ///   2. 每个队友有自己的**偏移目标位**，不是全部指向玩家同一个点。都指向同一点
-        ///      会让几辆车挤在一处互相顶。
-        ///
-        ///   3. 任务按计时器重发，不是每帧。每帧重发会让车原地抽搐而不前进。
+        /// 用 Task.VehicleFollow —— SHVDN 对 TASK_VEHICLE_ESCORT/跟随 的封装，
+        /// 是"开这辆车跟着那个实体"的专用任务，比手搓 DRIVE_TO_COORD 可靠得多：
+        /// 前者由引擎自己维持跟随关系，后者需要我反复重发坐标，一旦重发节奏不对
+        /// 车就会停在原地。
         /// </summary>
         private void UpdateVehicleEscort(Ped player)
         {
-            if (!_escortMode) return;
+            if (!_escortMode && !_escortPending) return;
 
             try
             {
+                // 先处理"座驾还没生成"的状态：模型加载完才创建车辆
+                if (_escortPending)
+                {
+                    UpdateEscortSpawn(player);
+                    return;
+                }
+
                 if (_escortVehicle == null || !_escortVehicle.Exists() || _escortVehicle.IsDead)
                 {
                     _escortMode = false;
@@ -949,51 +1024,24 @@ namespace GTA5Buddy
                 }
 
                 float distance = _escortVehicle.Position.DistanceTo(player.Position);
-                bool farBehind = distance > 40.0f;
+                bool farBehind = distance > 45.0f;
 
-                // 路上堵住时也要能重发任务，所以除了计时器还看"是否几乎停住"
-                bool stuck = _escortVehicle.Speed < 1.0f && distance > 15.0f;
+                // 距离很远，或车几乎停住（可能卡在路口/障碍）时立刻重发任务；
+                // 否则按计时器保持。每帧重发会让车抽搐，完全不重发则会停在原地。
+                bool stuck = _escortVehicle.Speed < 1.0f && distance > 12.0f;
 
                 if (!farBehind && !stuck && Game.GameTime < _nextEscortTask) return;
-                _nextEscortTask = Game.GameTime + (stuck ? 1200 : 2000);
+                _nextEscortTask = Game.GameTime + (stuck ? 1000 : 2500);
 
-                // 每个队友一个错开的跟随位，避免几辆车叠在同一点
-                Vector3 dest = EscortSlotPosition(player, _squadIndex);
+                // 落后越远开得越快，避免永远追不上
+                float cruise = farBehind ? 35.0f : (_squadIndex == 0 ? 22.0f : 19.0f);
 
-                float speed = farBehind ? 32.0f : (_squadIndex == 0 ? 20.0f : 17.0f);
-                float stopRange = farBehind ? 14.0f : 10.0f;
+                // 跟随距离：0 号跟得最近，后面的依次拉开，形成梯队而不是挤成一团
+                int followDistance = 8 + (_squadIndex * 3);
 
-                // Normal = 786603：遵守交通、避让行人车辆。想让队友更激进可换 Rushed。
-                const int driveMode = 786603;
-
-                // 用路网版本：引擎会规划道路路径，而不是朝目标点直线冲
-                Function.Call(Hash.TASK_VEHICLE_DRIVE_TO_COORD_LONGRANGE,
-                              _ped, _escortVehicle,
-                              dest.X, dest.Y, dest.Z,
-                              speed, driveMode, stopRange);
+                _ped.Task.VehicleFollow(_escortVehicle, player, cruise, EscortDrivingFlags, followDistance);
             }
             catch (Exception ex) { BuddyLog.Error("UpdateVehicleEscort failed", ex); }
-        }
-
-        /// <summary>
-        /// 队友 i 的跟随位：以玩家为原点做一个沿行进方向的梯队展开，
-        /// 0 号紧跟正后方，后面的依次向两侧错开。
-        /// </summary>
-        private static Vector3 EscortSlotPosition(Ped player, int index)
-        {
-            try
-            {
-                if (index <= 0) return player.Position;
-
-                // 横向第几个、纵向第几排
-                int lateral = ((index + 1) / 2) * ((index % 2 == 0) ? 1 : -1);
-                int row = (index + 1) / 2;
-
-                Vector3 back = player.ForwardVector * -(6.0f + (row * 4.0f));
-                Vector3 side = player.RightVector * (lateral * 3.5f);
-                return player.Position + back + side;
-            }
-            catch (Exception) { return player.Position; }
         }
 
         // ==================================================================
