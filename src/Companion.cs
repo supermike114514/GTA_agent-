@@ -828,6 +828,10 @@ namespace GTA5Buddy
         private int _nextEscortDiag;   // 诊断日志节流
         private Vector3? _lastEscortPos;   // 上次下发任务时车的位置，用于算"动了多远"
 
+        // 直接驾驶兜底：引擎驾驶 AI 对履带/特种载具常常无效，卡住 5 秒后启用。
+        private bool _escortDirectDrive;
+        private int _escortStallSince;
+
         /// <summary>True while the companion is driving its own car to keep up with the player.</summary>
         internal bool EscortMode { get { return _escortMode; } }
 
@@ -944,6 +948,9 @@ namespace GTA5Buddy
                 Function.Call(Hash.SET_DRIVER_AGGRESSIVENESS, _ped, 0.5f);
 
                 _escortVehicle = car;
+                _escortDirectDrive = false;   // 新车重新从"AI 驾驶"开始试
+                _escortStallSince = 0;
+                _lastEscortPos = null;
                 _state = BuddyState.InVehicle;
                 _nextEscortTask = 0;
 
@@ -965,6 +972,9 @@ namespace GTA5Buddy
             {
                 _escortMode = false;
                 _escortPending = false;      // 取消还没生成完的座驾请求
+                _escortDirectDrive = false;
+                _escortStallSince = 0;
+                _lastEscortPos = null;
                 _nextEscortTask = 0;
 
                 if (_escortVehicle != null && _escortVehicle.Exists())
@@ -1083,6 +1093,41 @@ namespace GTA5Buddy
 
                 bool stalled = _escortVehicle.Speed < 1.0f && distance > 15.0f;
 
+                // ---- 卡住检测 → 自动切到"直接驾驶" ----------------------------
+                //
+                // 引擎的驾驶 AI 对**履带车/特种载具**（坦克 Rhino、Khanjali、APC、
+                // HalfTrack 等）经常拒绝正常执行：任务下发成功、状态是 Performing，
+                // 但车就是不动。这类车用任何 TASK_VEHICLE_* 都救不回来。
+                //
+                // 所以这里做兜底：任务在跑却持续不动超过 5 秒，就改用**直接控制**
+                // （自己给前进速度和转向），完全绕过引擎驾驶 AI。
+                // 这条路径对任何有 ForwardSpeed 的载具都有效。
+                if (stalled)
+                {
+                    if (_escortStallSince == 0) _escortStallSince = Game.GameTime;
+
+                    if (!_escortDirectDrive &&
+                        Game.GameTime - _escortStallSince > 5000)
+                    {
+                        _escortDirectDrive = true;
+                        BuddyLog.Info("escort[" + _squadIndex + "]: AI driving stalled for 5s, " +
+                                      "switching to DIRECT DRIVE (model=" +
+                                      _escortVehicle.Model.Hash + ", class=" +
+                                      _escortVehicle.ClassType + ")");
+                        Notify("~y~队友 " + (_squadIndex + 1) + " 号的车 AI 驾驶失效，已切换直接控制");
+                    }
+                }
+                else
+                {
+                    _escortStallSince = 0;
+                }
+
+                if (_escortDirectDrive)
+                {
+                    DirectDriveToward(player, distance);
+                    return;
+                }
+
                 // 任务在正常跑、而且车没卡住 —— 什么都不要做，别去打断它
                 if (taskRunning && !stalled) return;
 
@@ -1164,6 +1209,92 @@ namespace GTA5Buddy
                               " moved=" + moved.ToString("0.0"));
             }
             catch (Exception ex) { BuddyLog.Error("UpdateVehicleEscort failed", ex); }
+        }
+
+        // ==================================================================
+        // 直接驾驶兜底
+        //
+        // 引擎的驾驶 AI 对履带/特种载具（坦克 Rhino、Khanjali、APC、HalfTrack 等）
+        // 经常拒绝执行：任务下发成功、状态是 Performing，车却一动不动。
+        // 这种情况下任何 TASK_VEHICLE_* 都救不回来，只能自己控制。
+        //
+        // 做法：每 tick 让车头朝玩家方向转一个小角度，并直接设前进速度。
+        // 不依赖任何驾驶 AI，任何有 ForwardSpeed 的地面载具都能用。
+        // ==================================================================
+
+        private void DirectDriveToward(Ped player, float distance)
+        {
+            try
+            {
+                Vehicle car = _escortVehicle;
+                if (car == null || !car.Exists()) return;
+
+                // 飞行器不走这条路：它们由 HELI_CHASE / PLANE_CHASE 负责，
+                // 直接设 ForwardSpeed 会让它们掉下来。
+                if (car.IsAircraft) return;
+
+                // 足够近就停住，别再推着车往玩家身上撞
+                if (distance < 12.0f)
+                {
+                    car.ForwardSpeed = 0.0f;
+                    return;
+                }
+
+                Vector3 pos = car.Position;
+
+                // ---- 转向：朝玩家的方位，每次只转一点，避免车头瞬间跳变 ----
+                float desired = HeadingTo(pos, player.Position);
+                float delta = NormalizeAngle(desired - car.Heading);
+
+                const float maxTurnPerTick = 2.5f;
+                if (delta > maxTurnPerTick) delta = maxTurnPerTick;
+                if (delta < -maxTurnPerTick) delta = -maxTurnPerTick;
+
+                car.Heading = Normalize360(car.Heading + delta);
+
+                // ---- 前进：离得越远开得越快 ----
+                float speed = distance > 60.0f ? 30.0f : (distance > 25.0f ? 18.0f : 10.0f);
+                car.ForwardSpeed = speed;
+
+                if (Game.GameTime >= _nextEscortDiag)
+                {
+                    _nextEscortDiag = Game.GameTime + 2000;
+                    BuddyLog.Info("escort[" + _squadIndex + "]: DIRECT DRIVE  dist=" +
+                                  distance.ToString("0.0") + " speed=" + speed.ToString("0.0") +
+                                  " heading=" + car.Heading.ToString("0") +
+                                  " desired=" + desired.ToString("0") +
+                                  " vehSpeed=" + car.Speed.ToString("0.0"));
+                }
+            }
+            catch (Exception ex) { BuddyLog.Error("DirectDriveToward failed", ex); }
+        }
+
+        /// <summary>
+        /// 世界坐标下的朝向角。GTA 约定：0=北，逆时针增大（90=西，180=南，270=东）。
+        /// 推导：朝北 (dx=0, dy=1) 应为 0；朝西 (dx=-1, dy=0) 应为 90。
+        /// 因此 heading = atan2(-dx, dy)。
+        /// </summary>
+        private static float HeadingTo(Vector3 from, Vector3 to)
+        {
+            float dx = to.X - from.X;
+            float dy = to.Y - from.Y;
+            double deg = Math.Atan2(-dx, dy) * 180.0 / Math.PI;
+            return Normalize360((float)deg);
+        }
+
+        private static float Normalize360(float deg)
+        {
+            deg %= 360f;
+            if (deg < 0f) deg += 360f;
+            return deg;
+        }
+
+        /// <summary>把角度差归一到 [-180, 180]，用于取最短转向方向。</summary>
+        private static float NormalizeAngle(float deg)
+        {
+            deg = Normalize360(deg);
+            if (deg > 180f) deg -= 360f;
+            return deg;
         }
 
         // ==================================================================
