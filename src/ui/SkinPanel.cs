@@ -289,6 +289,24 @@ namespace GTA5Buddy
             return _db;
         }
 
+        /// <summary>
+        /// 从数据库里取最多 max 个可用模型哈希，供"批量生成时轮换皮肤"使用。
+        ///
+        /// 只取 Spawnable 的条目：不可用的模型会让 CreatePed 产出空壳。
+        /// 按显示顺序取（不是随机），这样结果可复现，也便于用户预期会看到哪一批外观。
+        /// </summary>
+        internal List<PedHash> GetModelHashes(int max)
+        {
+            var list = new List<PedHash>();
+            foreach (Entry e in _db)
+            {
+                if (!e.Spawnable) continue;
+                list.Add(e.Hash);
+                if (list.Count >= max) break;
+            }
+            return list;
+        }
+
         internal void Rebuild()
         {
             if (!_built)

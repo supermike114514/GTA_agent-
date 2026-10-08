@@ -1,6 +1,10 @@
 using System;
 using System.Collections.Generic;
+using System.Drawing;
 using GTA;
+using GTA.Math;
+using GTA.Native;
+using GTA.UI;
 
 namespace GTA5Buddy
 {
@@ -43,8 +47,97 @@ namespace GTA5Buddy
         /// <summary>所有在场的队友，供遍历下达指令。</summary>
         internal IEnumerable<Companion> All { get { return _agents; } }
 
+        /// <summary>
+        /// 通知助手。AgentSquad 不是 Script 派生类，用不到继承来的 Notify，
+        /// 所以直接走底层的 ticker 接口。
+        /// </summary>
+        private static void Notify(string message)
+        {
+            try { GTA.UI.Notification.PostTicker(message, false, true); }
+            catch (Exception) { }
+        }
         /// <summary>读一份快照，避免遍历时列表被改动。</summary>
         internal Companion[] Snapshot() { return _agents.ToArray(); }
+
+        /// <summary>
+        /// 为队伍里的队友分配车辆座位。
+        ///
+        /// 规则（按用户要求）：
+        ///   * 一辆车要尽量坐满 —— 按座位索引遍历，找空位就坐，而不是一人一辆车；
+        ///   * 坐满之后才生成下一辆，继续往里塞；
+        ///   * 0 号坐驾驶位，这样车会真的开起来而不是停着。
+        ///
+        /// 座位索引：-1 是驾驶位，0 是副驾，1..N 是后排与附加座。
+        /// </summary>
+        internal void LoadIntoVehicles(VehicleHash model)
+        {
+            try
+            {
+                Model carModel = new Model(model);
+                if (!carModel.IsValid) { Notify("~r~载具模型不可用"); return; }
+
+                carModel.Request(1000);
+                int waited = 0;
+                while (!carModel.IsLoaded && waited < 4000) { Script.Wait(0); waited += 50; }
+                if (!carModel.IsLoaded) { Notify("~r~载具模型加载超时"); return; }
+
+                Ped player = Game.Player.Character;
+                if (player == null || !player.Exists()) return;
+
+                Vehicle car = null;
+                int seat = -1;
+                int maxSeat = 0;
+                int loaded = 0;
+
+                foreach (Companion agent in _agents.ToArray())
+                {
+                    if (!agent.Exists) continue;
+
+                    // 需要一辆新车：当前车不存在，或座位已坐满
+                    if (car == null || seat > maxSeat)
+                    {
+                        Vector3 pos = player.Position + player.ForwardVector * (8.0f + (loaded * 1.2f));
+                        float groundZ;
+                        if (World.GetGroundHeight(pos, out groundZ))
+                            pos = new Vector3(pos.X, pos.Y, groundZ + 0.5f);
+
+                        car = World.CreateVehicle(carModel, pos, player.Heading);
+                        if (car == null || !car.Exists())
+                        {
+                            Notify("~r~生成载具失败");
+                            return;
+                        }
+
+                        car.IsPersistent = true;
+                        car.PlaceOnGround();
+                        car.IsEngineRunning = true;
+
+                        // 座位总数含驾驶位：PassengerCapacity 不含驾驶员，所以 +1
+                        maxSeat = Function.Call<int>(Hash.GET_VEHICLE_MAX_NUMBER_OF_PASSENGERS, car);
+                        seat = -1;
+                        Script.Wait(0);
+                    }
+
+                    // 找到这辆车里下一个空座位
+                    while (seat <= maxSeat && !car.IsSeatFree((VehicleSeat)seat)) seat++;
+
+                    if (seat > maxSeat)
+                    {
+                        // 这辆车满了：下一轮循环开新车，并重试同一个队友
+                        car = null;
+                        continue;
+                    }
+
+                    agent.WarpIntoVehicle(car, (VehicleSeat)seat);
+                    seat++;
+                    loaded++;
+                }
+
+                Notify("~g~已安排 " + loaded + " 个队友上车（尽量坐满每辆车）");
+                BuddyLog.Info("squad: loaded " + loaded + " agents into vehicles, model=" + model);
+            }
+            catch (Exception ex) { BuddyLog.Error("LoadIntoVehicles failed", ex); }
+        }
 
         /// <summary>
         /// 生成指定数量的队友，全部使用同一个模型。
@@ -82,24 +175,71 @@ namespace GTA5Buddy
                 return 0;
             }
 
+            return SpawnLoop(hash, quantity, null, out error);
+        }
+
+        /// <summary>
+        /// 批量生成，每个队友从给定的皮肤列表里轮换取一个。
+        ///
+        /// 轮换而不是全部随机：随机会出现"5 个人里 4 个长得一样"。按顺序循环能保证
+        /// 队形在视觉上尽量分散，同时第 N 个和第 N+len 个仍然可能相同，这是可接受的。
+        /// </summary>
+        internal int SpawnManyVaried(IList<PedHash> skins, int quantity, out string error)
+        {
+            error = null;
+            if (skins == null || skins.Count == 0)
+            {
+                error = "皮肤列表为空";
+                return 0;
+            }
+            if (quantity < 1) quantity = 1;
+
+            return SpawnLoop(skins[0], quantity, skins, out error);
+        }
+
+        /// <summary>生成循环：skins 为 null 时全部用 baseHash，否则逐个轮换。</summary>
+        private int SpawnLoop(PedHash baseHash, int quantity, IList<PedHash> skins, out string error)
+        {
+            error = null;
+            var loaded = new Dictionary<PedHash, Model>();
+
             int made = 0;
             for (int i = 0; i < quantity; i++)
             {
-                // 每次都新建一个空实例（尚未生成 Ped），再让它自己按这个模型生成。
+                PedHash hash = (skins == null) ? baseHash : skins[i % skins.Count];
+
+                // 每个用到的模型只加载一次；批量生成同皮肤时这是最省时的做法
+                Model model;
+                if (!loaded.TryGetValue(hash, out model))
+                {
+                    model = new Model(hash);
+                    if (!model.IsPed)
+                    {
+                        BuddyLog.Warn("squad: skipped non-ped model in batch, hash=" + hash);
+                        continue;
+                    }
+
+                    model.Request(1000);
+                    int waited = 0;
+                    while (!model.IsLoaded && waited < 5000) { Script.Wait(0); waited += 50; }
+                    if (!model.IsLoaded)
+                    {
+                        BuddyLog.Warn("squad: model failed to load in batch, hash=" + hash);
+                        continue;
+                    }
+                    loaded[hash] = model;
+                }
+
                 Companion agent = CreateAgent();
                 agent.SetSpawnModel(hash);
 
                 if (agent.SpawnWithModel(hash)) made++;
-                else
-                {
-                    // 生成失败就把这个空壳移出队伍，避免留下"存在但没有 Ped"的队友拖慢遍历
-                    _agents.Remove(agent);
-                }
+                else _agents.Remove(agent);   // 生成失败就移除空壳，别拖慢遍历
 
-                Script.Wait(0);   // 逐个生成之间推进一帧，避免密集生成卡住
+                Script.Wait(0);
             }
 
-            if (made == 0) error = "生成失败（世界拒绝了该模型）";
+            if (made == 0) error = "生成失败（世界拒绝了这些模型）";
             return made;
         }
 

@@ -60,6 +60,10 @@ namespace GTA5Buddy
         private PedHash _spawnHash = DefaultBuddyModel;
         private string _spawnLabel = "默认皮肤";
 
+        /// <summary>批量生成时是否轮换皮肤（每个队友取数据库里不同的模型）。</summary>
+        private bool _varySkins;
+        private NativeCheckboxItem _varySkinsItem;
+
         // ---- 队友座驾：从刷车器里任选型号 ----
         private readonly NativeMenu _escortPicker;
         private readonly NativeMenu _agentSkinPicker;
@@ -333,8 +337,21 @@ namespace GTA5Buddy
             skin.Activated += delegate
             {
                 RebuildAgentSkinPicker();
+                _agentSpawn.Visible = false;
+                _agentSkinPicker.Visible = true;
             };
             _agentSpawn.Add(skin);
+
+            // 批量轮换皮肤：勾上后每个队友取数据库里不同的模型，队伍外观不重样
+            _varySkinsItem = new NativeCheckboxItem("批量时轮换皮肤",
+                                                    "每个队友用数据库中不同的模型",
+                                                    _varySkins);
+            _varySkinsItem.CheckboxChanged += delegate
+            {
+                _varySkins = _varySkinsItem.Checked;
+                Notify(_varySkins ? "~b~批量生成将轮换皮肤" : "~b~批量生成统一使用所选皮肤");
+            };
+            _agentSpawn.Add(_varySkinsItem);
 
             AddAction(_agentSpawn, "收回全部队友", "移除队内所有队友", delegate
                 { _squad.DespawnAll(); });
@@ -376,7 +393,27 @@ namespace GTA5Buddy
             try
             {
                 string error;
-                int made = _squad.SpawnMany(_spawnHash, _spawnQuantity, out error);
+                int made;
+
+                if (_varySkins)
+                {
+                    // 批量时轮换皮肤：从人物模型数据库里取一批可用模型，逐个循环使用。
+                    // 取 24 个足够让一支小队外观各不相同，又不必加载整库。
+                    var skins = _skinData.GetModelHashes(24);
+                    if (skins.Count == 0)
+                    {
+                        // 数据库还没建好时退回单一皮肤，而不是报错什么都不生成
+                        made = _squad.SpawnMany(_spawnHash, _spawnQuantity, out error);
+                    }
+                    else
+                    {
+                        made = _squad.SpawnManyVaried(skins, _spawnQuantity, out error);
+                    }
+                }
+                else
+                {
+                    made = _squad.SpawnMany(_spawnHash, _spawnQuantity, out error);
+                }
 
                 if (made == 0)
                 {
@@ -384,7 +421,8 @@ namespace GTA5Buddy
                 }
                 else
                 {
-                    Notify("~g~已生成 " + made + " 个队友（" + _spawnLabel + "），共 " + _squad.Count + " 个");
+                    string how = _varySkins ? "轮换皮肤" : _spawnLabel;
+                    Notify("~g~已生成 " + made + " 个队友（" + how + "），共 " + _squad.Count + " 个");
                 }
             }
             catch (Exception ex)
@@ -688,6 +726,12 @@ namespace GTA5Buddy
 
             AddAction(_vehicles, "队友 · 停止开车跟随", "移除队友的车", delegate
                 { _squad.StopVehicleEscortAll(); });
+
+            // 座位分配：一辆车尽量坐满，坐满才生成下一辆。
+            // 与"开车跟随"是两条不同的用法：这是把队伍塞进车里，那是各自开车跟着你。
+            AddAction(_vehicles, "队友 · 全部坐进「" + _escortLabel + "」",
+                      "一辆车坐满再开下一辆，遍历座位入座",
+                      delegate { _squad.LoadIntoVehicles(_escortModel); });
 
             int shown = 0;
             foreach (VehiclePanel.Entry e in _vehicleData.VisibleEntries())

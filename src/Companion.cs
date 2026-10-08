@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using GTA;
 using GTA.Math;
@@ -908,8 +908,18 @@ namespace GTA5Buddy
         }
 
         /// <summary>
-        /// Per-tick upkeep for escort mode. The drive task is re-issued on a timer rather than
-        /// every frame: re-tasking each tick makes the car stutter instead of drive.
+        /// Per-tick upkeep for escort mode.
+        ///
+        /// 三个要点（都是实测反馈出来的问题）：
+        ///
+        ///   1. 走**道路网**而不是直线。原来用 TASK_VEHICLE_DRIVE_TO_COORD，它会让车
+        ///      朝目标点直线开（撞墙、抄野地）。改用 _LONGRANGE 变体，引擎会自己规划
+        ///      路网路径。
+        ///
+        ///   2. 每个队友有自己的**偏移目标位**，不是全部指向玩家同一个点。都指向同一点
+        ///      会让几辆车挤在一处互相顶。
+        ///
+        ///   3. 任务按计时器重发，不是每帧。每帧重发会让车原地抽搐而不前进。
         /// </summary>
         private void UpdateVehicleEscort(Ped player)
         {
@@ -938,25 +948,93 @@ namespace GTA5Buddy
                     return;
                 }
 
-                // Re-issue the drive-to-player task on a timer, and sooner if we fell behind.
                 float distance = _escortVehicle.Position.DistanceTo(player.Position);
                 bool farBehind = distance > 40.0f;
-                if (!farBehind && Game.GameTime < _nextEscortTask) return;
 
-                _nextEscortTask = Game.GameTime + 2500;
+                // 路上堵住时也要能重发任务，所以除了计时器还看"是否几乎停住"
+                bool stuck = _escortVehicle.Speed < 1.0f && distance > 15.0f;
 
-                Vector3 dest = player.Position;
-                float speed = farBehind ? 30.0f : 18.0f;
-                float stopRange = farBehind ? 12.0f : 8.0f;
-                const int driveMode = 786603;   // 常规驾驶 + 避开行人/车辆
+                if (!farBehind && !stuck && Game.GameTime < _nextEscortTask) return;
+                _nextEscortTask = Game.GameTime + (stuck ? 1200 : 2000);
 
-                Function.Call(Hash.TASK_VEHICLE_DRIVE_TO_COORD,
+                // 每个队友一个错开的跟随位，避免几辆车叠在同一点
+                Vector3 dest = EscortSlotPosition(player, _squadIndex);
+
+                float speed = farBehind ? 32.0f : (_squadIndex == 0 ? 20.0f : 17.0f);
+                float stopRange = farBehind ? 14.0f : 10.0f;
+
+                // Normal = 786603：遵守交通、避让行人车辆。想让队友更激进可换 Rushed。
+                const int driveMode = 786603;
+
+                // 用路网版本：引擎会规划道路路径，而不是朝目标点直线冲
+                Function.Call(Hash.TASK_VEHICLE_DRIVE_TO_COORD_LONGRANGE,
                               _ped, _escortVehicle,
                               dest.X, dest.Y, dest.Z,
-                              speed, 0, _escortVehicle.Model.Hash,
-                              driveMode, stopRange, 1.0f);
+                              speed, driveMode, stopRange);
             }
             catch (Exception ex) { BuddyLog.Error("UpdateVehicleEscort failed", ex); }
+        }
+
+        /// <summary>
+        /// 队友 i 的跟随位：以玩家为原点做一个沿行进方向的梯队展开，
+        /// 0 号紧跟正后方，后面的依次向两侧错开。
+        /// </summary>
+        private static Vector3 EscortSlotPosition(Ped player, int index)
+        {
+            try
+            {
+                if (index <= 0) return player.Position;
+
+                // 横向第几个、纵向第几排
+                int lateral = ((index + 1) / 2) * ((index % 2 == 0) ? 1 : -1);
+                int row = (index + 1) / 2;
+
+                Vector3 back = player.ForwardVector * -(6.0f + (row * 4.0f));
+                Vector3 side = player.RightVector * (lateral * 3.5f);
+                return player.Position + back + side;
+            }
+            catch (Exception) { return player.Position; }
+        }
+
+        // ==================================================================
+        // 关系组：多队友之间必须互相友好
+        //
+        // 这是"队友互相攻击"的根因所在：
+        //
+        //   每个队友有自己独立的关系组（BUDDY_MOD_GROUP_1、_2 …），这是为了不让引擎
+        //   把不同队友当成同一组。但只设置"队友组 ↔ 玩家组"是不够的 ——
+        //   在队友 1 眼里，队友 2 属于一个**陌生组**，默认没有友好关系，于是直接开打。
+        //
+        //   所以每创建一个新组，都要和**已存在的所有队友组**互相建立友好关系。
+        //   用一张静态表记录所有队友组，新组创建时补齐两两关系。
+        // ==================================================================
+
+        private static readonly List<RelationshipGroup> s_allyGroups = new List<RelationshipGroup>();
+
+        /// <summary>把新建立的队友组与已有的每一个队友组设为互相友好。</summary>
+        private static void LinkAllyGroup(RelationshipGroup group)
+        {
+            try
+            {
+                // 遍历副本：LinkAllyGroup 之外可能并发注册新组
+                RelationshipGroup[] existing = s_allyGroups.ToArray();
+
+                foreach (RelationshipGroup other in existing)
+                {
+                    if (other.Hash == group.Hash) continue;
+
+                    // RESPECT 双向：既不主动攻击，也不会被对方攻击
+                    Function.Call(Hash.SET_RELATIONSHIP_BETWEEN_GROUPS, 0, group, other, "RESPECT");
+                    Function.Call(Hash.SET_RELATIONSHIP_BETWEEN_GROUPS, 0, other, group, "RESPECT");
+
+                    // 再显式标记为友好，避免"中立"被某些任务判成可攻击目标
+                    Function.Call(Hash.SET_RELATIONSHIP_BETWEEN_GROUPS, 1, group, other, "RESPECT");
+                    Function.Call(Hash.SET_RELATIONSHIP_BETWEEN_GROUPS, 1, other, group, "RESPECT");
+                }
+
+                s_allyGroups.Add(group);
+            }
+            catch (Exception ex) { BuddyLog.Error("LinkAllyGroup failed", ex); }
         }
 
         private void EnsureRelationshipGroups(Ped player)
@@ -965,11 +1043,13 @@ namespace GTA5Buddy
             {
                 if (!_groupCreated)
                 {
-                    // 每个队友用唯一的关系组名。多实例共用同一个名字会让引擎把两个队友
-                    // 当成同一组处理，互相之间的关系与伤害过滤都会错乱。
+                    // 每个队友用唯一的关系组名，见本段开头的说明。
                     _group = World.AddRelationshipGroup(_relationshipGroupName);
                     _groupCreated = true;
                     Function.Call(Hash.SET_RELATIONSHIP_BETWEEN_GROUPS, 0, _group, _group, "BUDDY");
+
+                    // 关键：与所有已有队友组建立友好关系，否则队友之间会互相攻击
+                    LinkAllyGroup(_group);
                 }
                 if (!_playerGroupCaptured)
                 {
@@ -979,11 +1059,31 @@ namespace GTA5Buddy
                 // The buddy must not be hostile to the player, and vice versa.
                 Function.Call(Hash.SET_RELATIONSHIP_BETWEEN_GROUPS, 0, _group, _playerGroup.Hash, "RESPECT");
                 Function.Call(Hash.SET_RELATIONSHIP_BETWEEN_GROUPS, 0, _playerGroup.Hash, _group.Hash, "RESPECT");
+
+                // 每个新组都要和玩家组也建立一遍（LinkAllyGroup 只管队友之间）
+                LinkAllyGroupToPlayer(_playerGroup);
             }
             catch (Exception)
             {
                 _groupCreated = false;
             }
+        }
+
+        /// <summary>
+        /// 确保所有队友组与当前玩家组互相友好。玩家组在游戏过程中可能变化
+        /// （例如换角色），所以每次调用都重放一遍关系设置。
+        /// </summary>
+        private static void LinkAllyGroupToPlayer(RelationshipGroup playerGroup)
+        {
+            try
+            {
+                foreach (RelationshipGroup ally in s_allyGroups.ToArray())
+                {
+                    Function.Call(Hash.SET_RELATIONSHIP_BETWEEN_GROUPS, 0, ally, playerGroup.Hash, "RESPECT");
+                    Function.Call(Hash.SET_RELATIONSHIP_BETWEEN_GROUPS, 0, playerGroup.Hash, ally, "RESPECT");
+                }
+            }
+            catch (Exception) { }
         }
 
         // ==================================================================
@@ -1005,6 +1105,18 @@ namespace GTA5Buddy
 
         /// <summary>由 AgentSquad 指定这一位的皮肤（生成前调用）。</summary>
         internal void SetSpawnModel(PedHash hash) { _spawnModel = hash; }
+
+        /// <summary>把这一位直接放进指定座位（用于队伍安排上车）。</summary>
+        internal void WarpIntoVehicle(Vehicle vehicle, VehicleSeat seat)
+        {
+            try
+            {
+                if (!Exists || vehicle == null || !vehicle.Exists()) return;
+                Function.Call(Hash.SET_PED_INTO_VEHICLE, _ped, vehicle, (int)seat);
+                _state = BuddyState.InVehicle;
+            }
+            catch (Exception ex) { BuddyLog.Error("WarpIntoVehicle failed", ex); }
+        }
 
         /// <summary>
         /// 是否绘制 HUD。多个队友同时画会在同一屏幕位置叠成一团，
