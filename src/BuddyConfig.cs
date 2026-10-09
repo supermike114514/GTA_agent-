@@ -105,11 +105,46 @@ namespace GTA5Buddy
         /// <summary>
         /// TASK_VEHICLE_GOTO_NAVMESH 的重发间隔（毫秒）。
         ///
-        /// 这是个**点任务**，不会自己跟踪移动实体，所以必须按节奏把玩家的新坐标喂给它。
-        /// 间隔要权衡：太短会不断打断路径规划，太长会跟不上移动的玩家。
-        /// 1500ms 在 20 m/s 下对应约 30 米的前瞻，够用。
+        /// **这是点任务，只下发一次它执行完就停了** —— 必须在 tick 循环里
+        /// 持续重发并传入玩家的最新坐标，否则 AI 只会动一下就静止。
+        ///
+        /// 用户建议约每 20 个游戏周期一调：60fps 下 20 tick ≈ 333ms。
+        /// 之前我设成 1500ms，后来又加了"意图不变就不重发"的优化 ——
+        /// 那个优化对持续型任务（ESCORT/HELI_CHASE）正确，对点任务是致命的，
+        /// 实测表现就是车队全部停在原地。
         /// </summary>
-        internal const int NavmeshReissueMs = 1500;
+        internal const int NavmeshReissueMs = 333;
+
+        /// <summary>
+        /// 跟随时使用的驾驶风格。
+        ///
+        /// 用户建议先用一个**已知完整、配置成套**的值来看行为是否正常，
+        /// 而不是零散地拼标志位：
+        ///   786603 = DrivingModeStopForVehicles，GTA 自己常用的完整风格
+        ///          （= FollowTraffic|YieldToPeds|AvoidVehicles|AvoidEmptyVehicles|
+        ///             AvoidPeds|AvoidObjects|StopAtTrafficLights|...）
+        ///
+        /// 先确认基础行为正常，再考虑叠加 ChangeLanesAroundObstructions、
+        /// UseStringPullingAtJunctions 这类进阶标志。
+        /// </summary>
+        internal const int EscortDrivingStyle = 786603;
+
+        /// <summary>
+        /// 进阶驾驶风格（含变道、逆行超车、路口抄近路）。行为确认正常后可以切到这个。
+        /// </summary>
+        internal const int EscortDrivingStyleAggressive = 786603
+            | 0x80000      // ChangeLanesAroundObstructions (524288)
+            | 0x2000000    // UseStringPullingAtJunctions (33554432)
+            | 0x200        // AllowGoingWrongWay (512)
+            | 0x100;       // GoOffRoadWhenAvoiding (256)
+
+        /// <summary>
+        /// 防卡死：车速持续为零超过这么久，就清任务并短暂倒车脱离（毫秒）。
+        /// </summary>
+        internal const int AntiStallTriggerMs = 2500;
+
+        /// <summary>倒车脱离的持续时间（毫秒）。</summary>
+        internal const int AntiStallReverseMs = 900;
 
         /// <summary>
         /// 传送冷却（毫秒）。**这是防止"一直在不断传送"的关键。**

@@ -876,6 +876,7 @@ namespace GTA5Buddy
         // 驾驶模式：true = Pure Pursuit 直接控制（引擎驾驶失效时的替代）
         // 两种驾驶方式互斥：_purePursuit 为 true 时绝不下发 TASK_VEHICLE_*
         private bool _purePursuit;
+        private int _nextAntiStall;   // 防卡死倒车节流
         private int _nextRelationSync;   // 关系表同步节流
 
         /// <summary>
@@ -1297,57 +1298,26 @@ namespace GTA5Buddy
                     return;
                 }
 
-                // 任务已存在、而且车没卡住 —— 什么都不要做，别去打断它
-                if (taskPresent && !stalled) return;
-
-                // 卡住时给它一段观察期再重发，避免频繁重置
-                if (taskPresent && stalled && Game.GameTime < _nextEscortTask) return;
-
-                // ---- 阶梯 1 生效中：用引擎的长距离寻路任务 ----------------------
-                if (_escortLongRange && !_escortVehicle.IsHelicopter && !_escortVehicle.IsPlane)
-                {
-                    _nextEscortTask = Game.GameTime + BuddyConfig.NavmeshReissueMs;
-                    Vector3 lr = player.Position;
-                    Function.Call(Hash.TASK_VEHICLE_DRIVE_TO_COORD_LONGRANGE,
-                                  _ped, _escortVehicle,
-                                  lr.X, lr.Y, lr.Z,
-                                  distance > 200.0f ? 45.0f : 28.0f,
-                                  (int)EscortDrivingFlags,
-                                  distance > 100.0f ? 25.0f : 12.0f);
-
-                    if (Game.GameTime >= _nextEscortDiag)
-                    {
-                        _nextEscortDiag = Game.GameTime + 3000;
-                        BuddyLog.Info("escort[" + _squadIndex + "]: issued LONGRANGE  dist=" +
-                                      distance.ToString("0.0") + " vehSpeed=" +
-                                      _escortVehicle.Speed.ToString("0.0"));
-                    }
-                    return;
-                }
-
                 // ==================================================================
-                // 用引擎的"任务类型"系统驾驶（参考 GTA 自己的追车 / 攻击小队设计）
+                // 驾驶：地面载具用 GOTO_NAVMESH，**每 ~20 tick 持续重发 + 传入玩家最新坐标**
                 //
-                // GTA 本体的追车和护卫**不是**用"到点导航"任务，而是用
-                // VehicleMissionType 表达**意图**，再由引擎决定怎么开：
+                // 这是用户指出的关键点，也是之前"车队不跟随"的真正原因。
                 //
-                //     Follow(7)      跟住那个 ped —— 引擎自己处理变道、超车、绕障
-                //     EscortRear(12) 跟在那辆车的后方
-                //     Attack(6)      攻击那个目标（攻击小队用的）
-                //     PoliceBehaviour(16) 警察追车 AI 用的行为
+                // TASK_VEHICLE_GOTO_NAVMESH 是**点任务**：它只知道一个坐标，
+                // 下发一次、开到就停。要跟随**移动**的玩家，必须在 tick 循环里
+                // 持续重发并更新坐标（社区经验：约每 20 个游戏周期一次）。
                 //
-                // 用它的好处是这些能力全部由引擎提供，我不需要自己实现：
-                // 变道超车、绕开障碍、寻路失败时沿路绕行、路口抄近路（StringPulling）。
+                // 我之前的两个错误：
+                //   1. 重发间隔设成 1500ms（约 90 tick）—— 太慢，坐标严重滞后；
+                //   2. 后来又加了"意图不变就不重发"的优化 ——
+                //      那个优化对**持续型**任务（ESCORT / HELI_CHASE）是正确的，
+                //      对**点任务**是致命的：车动一下就永久静止。
+                //      实测表现就是整支车队钉在原地、靠传送硬撑。
                 //
-                // 之前用的 GOTO_NAVMESH 是"点任务" —— 它只知道一个坐标，
-                // 既不会变道也不会超车，还必须每 1.5 秒喂新坐标，
-                // 每次喂都可能打断路径规划。**这正是"跟不住"的结构性原因。**
-                //
-                // 任务类型是**持续型**的：只有"意图变了"才需要重新下发，
-                // 不需要按节奏重发。这一点由 _currentMission 记录来保证。
+                // 所以这里：**意图判断只用于持续型任务；点任务无条件按 tick 重发。**
                 // ==================================================================
 
-                // 飞行器：引擎有专门的追击任务
+                // 飞行器：引擎的持续型追击任务，下发一次即可
                 if (_escortVehicle.IsHelicopter)
                 {
                     if (taskPresent) return;
@@ -1364,18 +1334,44 @@ namespace GTA5Buddy
                     return;
                 }
 
-                // ---- 决定当前该用哪种任务类型 ----
+                // ---- 防卡死监控：车速持续为零 -> 清任务 + 短暂倒车脱离 ----------
                 //
-                // 战意优先：附近有敌人就切到 Attack（引擎的攻击任务会主动逼近并交战）。
-                // 每次检查前先刷新关系表：不刷新的话队友对警察/帮派是"中立"，
-                // 永远不会还击（这是"车内不攻击"的根本原因）。
+                // 用户建议的处理方式。倒车能有效脱离"顶住墙角/卡在障碍上"的状态，
+                // 之后重新下发跟随任务即可恢复。
+                if (stalled)
+                {
+                    int stalledMs = Game.GameTime - _escortStallSince;
+
+                    if (stalledMs >= BuddyConfig.AntiStallTriggerMs &&
+                        Game.GameTime >= _nextAntiStall)
+                    {
+                        _nextAntiStall = Game.GameTime + 3000;
+
+                        // 1) 清掉卡住的任务
+                        try { Function.Call(Hash.CLEAR_PED_TASKS, _ped); } catch (Exception) { }
+
+                        // 2) 短暂倒车脱离（action 3 = 倒车）
+                        Function.Call(Hash.TASK_VEHICLE_TEMP_ACTION,
+                                      _ped, _escortVehicle, 3,
+                                      BuddyConfig.AntiStallReverseMs);
+
+                        _currentMission = -1;      // 倒车结束后强制重新下发
+
+                        BuddyLog.Info("escort[" + _squadIndex + "]: ANTI-STALL - stuck " +
+                                      (stalledMs / 1000) + "s at speed " +
+                                      _escortVehicle.Speed.ToString("0.0") +
+                                      ", cleared tasks and reversing out");
+                        return;
+                    }
+                }
+
+                // ---- 关系表同步（不刷新的话队友对警察/帮派是中立，永远不还击）----
                 EnsureRelationshipGroups(player);
                 if (Game.GameTime >= _nextRelationSync)
                 {
                     _nextRelationSync = Game.GameTime + 2000;
                     MirrorPlayerRelationships(player);
                 }
-                Ped enemy = FindCombatTarget(player);
 
                 Vehicle playerCar = null;
                 try
@@ -1385,77 +1381,39 @@ namespace GTA5Buddy
                 }
                 catch (Exception) { }
 
-                // ---- 驾驶任务永远是"跟随"，**不用 Attack** ------------------
-                //
-                // 这是重要的架构修正。"有敌人就切 Attack"看起来合理，实测却是灾难：
-                //
-                //   issued ATTACK      176 次
-                //   issued ESCORT_REAR  27 次
-                //   速度平均 2.75，大部分时间为 0
-                //
-                // 原因是 **Attack 任务会让车停下来交战** —— 有敌人时它就一直不跟随，
-                // 车队钉在原地。
-                //
-                // 正确架构（也正是用户要求的"以玩家位置移动，同时保持开火能力"）：
-                //   * 驾驶层：**永远只做跟随**（EscortRear / Follow），车一直在动
-                //   * 战斗层：独立叠加，**不替换驾驶任务**
-                //       - 战斗属性让引擎的战斗 AI 自行开火，驾驶任务照常跑
-                //       - 车载武器用 SET_VEHICLE_SHOOT_AT_TARGET 转炮塔（独立一层）
-                //       - 乘客用 TASK_DRIVE_BY（乘客没有驾驶任务，不冲突）
-                int wantMission = (playerCar != null)
-                    ? (int)VehicleMissionType.EscortRear     // 12
-                    : (int)VehicleMissionType.Follow;        // 7
-
-                // 意图没变、任务还在、车也没卡住 —— 什么都不做，别去打断引擎
-                if (wantMission == _currentMission && taskPresent && !stalled) return;
-
-                // 卡住时给它一段观察期再重发
-                if (stalled && Game.GameTime < _nextEscortTask) return;
-                _nextEscortTask = Game.GameTime + 3000;
-
-                _currentMission = wantMission;
+                // ---- 点任务：按 ~20 tick 的节奏无条件重发，坐标取玩家最新位置 ----
+                if (Game.GameTime < _nextEscortTask) return;
+                _nextEscortTask = Game.GameTime + BuddyConfig.NavmeshReissueMs;
 
                 float cruise = distance > 45.0f ? 38.0f : (_squadIndex == 0 ? 26.0f : 22.0f);
-                string kind;
+                float stopRange = distance > 60.0f ? 22.0f : 12.0f;
 
-                if (playerCar != null)
-                {
-                    // ---- EscortRear(-1 / 12)：跟在那辆车后方 ----
-                    //
-                    // noRoadsDistance 给大一点：玩家经常开下公路，
-                    // 给 40 米让队友也敢跟下去，而不是在路边干等。
-                    Function.Call(Hash.TASK_VEHICLE_ESCORT,
-                                  _ped, _escortVehicle, playerCar,
-                                  (int)VehicleEscortType.Rear,
-                                  cruise,
-                                  (int)EscortDrivingFlags,
-                                  12.0f,     // minDistance：保持的最小间距
-                                  -1,
-                                  40.0f);    // noRoadsDistance
-                    kind = "ESCORT_REAR";
-                }
-                else
-                {
-                    // ---- Follow(7)：目标是人（玩家步行）----
-                    //
-                    // p6 = targetReachedDist：到这个距离就算跟上，车会停
-                    // p7 = straightLineDist：**不能设 0**，设 0 会让车直线冲向目标
-                    Function.Call(Hash.TASK_VEHICLE_MISSION_PED_TARGET,
-                                  _ped, _escortVehicle, player,
-                                  (int)VehicleMissionType.Follow,
-                                  cruise,
-                                  (int)EscortDrivingFlags,
-                                  12.0f,     // targetReachedDist
-                                  10.0f,     // straightLineDist
-                                  false);    // 不逆行（只是跟随）
-                    kind = "FOLLOW_PED";
-                }
+                // ★ 每次重发都用玩家**当前**坐标 —— 这是跟随移动目标的关键
+                Vector3 dest = player.Position;
 
-                BuddyLog.Info("escort[" + _squadIndex + "]: issued " + kind +
-                              "  dist=" + distance.ToString("0.0") +
-                              " cruise=" + cruise.ToString("0.0") +
-                              " vehSpeed=" + _escortVehicle.Speed.ToString("0.0") +
-                              " status=" + status + " taskPresent=" + taskPresent);
+                // 驾驶风格：先用已知完整的 786603 确认基础行为正常
+                int style = BuddyConfig.EscortDrivingStyle;
+
+                Function.Call(Hash.TASK_VEHICLE_GOTO_NAVMESH,
+                              _ped, _escortVehicle,
+                              dest.X, dest.Y, dest.Z,
+                              cruise,
+                              style,
+                              stopRange);
+
+                string kind = "GOTO_NAVMESH";
+
+                // 诊断：每 3 秒记一次，能看到车到底在不在动
+                if (Game.GameTime >= _nextEscortDiag)
+                {
+                    _nextEscortDiag = Game.GameTime + 3000;
+                    BuddyLog.Info("escort[" + _squadIndex + "]: issued " + kind +
+                                  "  dist=" + distance.ToString("0.0") +
+                                  " cruise=" + cruise.ToString("0.0") +
+                                  " stopRange=" + stopRange.ToString("0.0") +
+                                  " vehSpeed=" + _escortVehicle.Speed.ToString("0.0") +
+                                  " status=" + status + " taskPresent=" + taskPresent);
+                }
             }
             catch (Exception ex) { BuddyLog.Error("UpdateVehicleEscort failed", ex); }
         }
