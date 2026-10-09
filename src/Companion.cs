@@ -872,6 +872,10 @@ namespace GTA5Buddy
 
         // 乘车战斗是否已准备过（武器 + 属性只设一次，反复设置会打断驾驶任务）
         private bool _vehicleCombatReady;
+
+        // 驾驶模式：true = Pure Pursuit 直接控制（引擎驾驶失效时的替代）
+        // 两种驾驶方式互斥：_purePursuit 为 true 时绝不下发 TASK_VEHICLE_*
+        private bool _purePursuit;
         private int _nextRelationSync;   // 关系表同步节流
 
         /// <summary>
@@ -1213,22 +1217,19 @@ namespace GTA5Buddy
                 {
                     if (_escortStallSince == 0) _escortStallSince = Game.GameTime;
 
-                    // ---- 卡住的处理阶梯：**全部用引擎自带的任务/机制** ----------
+                    // ---- 卡住的处理阶梯 ------------------------------------------
                     //
-                    // 用户质疑得对："为什么 AI 失控时要切换自动驾驶，而不是用引擎内的
-                    // 车辆跟随函数和算法？"
-                    //
-                    // 直接驾驶（自己写 ForwardSpeed + Heading）绕过了引擎全部的碰撞规避、
-                    // 路网与物理约束 —— 那正是"车辆堆积成罗汉塔"的根源。
-                    // 所以默认路径不再用它，改成在引擎的任务之间换挡：
+                    // 引擎的驾驶 AI 对履带/特种载具（坦克、APC 等）经常拒绝执行：
+                    // 任务下发成功、状态也正常，车却一动不动。这时候按阶梯退让：
                     //
                     //   阶梯 1（4 秒）：换成 TASK_VEHICLE_DRIVE_TO_COORD_LONGRANGE
-                    //                   —— 引擎的另一套长距离寻路（专为远距离赶路设计）
-                    //   阶梯 2（10 秒）：清空任务让引擎重新规划
-                    //   再不行：交给引擎的小队传送（SET_PED_CAN_TELEPORT_TO_GROUP_LEADER）
-                    //           和 5 公里硬传送兜底
+                    //                   —— 引擎的另一套长距离寻路
+                    //   阶梯 2（8 秒）：切到 **Pure Pursuit**（自己实现，见下方说明）
+                    //   阶梯 3：交给传送兜底（近距离 200 米 / 远距离 5 公里）
                     //
-                    // 直接驾驶只保留给"变形金刚模式"这个特色功能。
+                    // Pure Pursuit 就是用户指出的 CCarAI/CAutoPilot 所用的方法：
+                    // 前视点 + 转向角，用**真实转向输入**而不是直接改朝向，
+                    // 所以不会再出现"叠罗汉"（那是绕过物理造成的）。
                     int stalledMs = Game.GameTime - _escortStallSince;
 
                     if (!_escortLongRange && stalledMs > 4000)
@@ -1240,12 +1241,10 @@ namespace GTA5Buddy
                                       _escortVehicle.ClassType + ")");
                     }
 
-                    if (_escortLongRange && stalledMs > 10000 && !_escortClearedOnce)
+                    // 阶梯 2：长时间卡住 -> 切 Pure Pursuit
+                    if (!_purePursuit && stalledMs > 8000)
                     {
-                        _escortClearedOnce = true;
-                        try { Function.Call(Hash.CLEAR_PED_TASKS, _ped); } catch (Exception) { }
-                        BuddyLog.Info("escort[" + _squadIndex + "]: still stalled 10s, " +
-                                      "cleared tasks to let the engine re-plan");
+                        EnterPurePursuit();
                     }
                 }
                 else
@@ -1258,6 +1257,25 @@ namespace GTA5Buddy
                 {
                     DirectDriveToward(player, distance);
                     return;
+                }
+
+                // ---- Pure Pursuit 模式：本 tick 完全由我们驾驶 --------------------
+                //
+                // **互斥保证**：这个分支直接 return，所以不会下发任何 TASK_VEHICLE_*。
+                // 进入该模式时已经 CLEAR_PED_TASKS，不会残留驾驶任务来抢控制权。
+                // 战斗是独立叠加层（炮塔瞄准不是任务），因此"边跟随边开火"不互斥。
+                if (_purePursuit)
+                {
+                    // 已经跟到位而且玩家没动 —— 让它回到引擎驾驶，省下每帧的直接控制
+                    if (distance < 25.0f && _escortVehicle.Speed < 2.0f)
+                    {
+                        ExitPurePursuit();
+                    }
+                    else
+                    {
+                        PurePursuitToward(player, distance);
+                        return;
+                    }
                 }
 
                 // ---- 近距离"跟不上"兜底：以玩家位置为准挪过来 --------------------
@@ -1443,15 +1461,237 @@ namespace GTA5Buddy
         }
 
         // ==================================================================
-        // 直接驾驶兜底
+        // Pure Pursuit 驾驶 —— 引擎驾驶失效时的替代路径
         //
-        // 引擎的驾驶 AI 对履带/特种载具（坦克 Rhino、Khanjali、APC、HalfTrack 等）
-        // 经常拒绝执行：任务下发成功、状态是 Performing，车却一动不动。
-        // 这种情况下任何 TASK_VEHICLE_* 都救不回来，只能自己控制。
+        // 参考 GTA 内部的 CCarAI / CAutoPilot：
+        //   它把目标位置 JoinCarWithRoadSystem 映射到路网，用 A*/Dijkstra 算路径，
+        //   再用 **Pure Pursuit** 沿路径行驶 —— 在车前方取"前视点"，
+        //   算出追踪它所需的转向角，于是能平滑地贴着路网开。
         //
-        // 做法：每 tick 让车头朝玩家方向转一个小角度，并直接设前进速度。
-        // 不依赖任何驾驶 AI，任何有 ForwardSpeed 的地面载具都能用。
+        // Pure Pursuit 转向律：
+        //     曲率  k      = 2 * sin(alpha) / Ld
+        //     前轮角 steer  = atan(轴距 * k)
+        //   alpha = 车头朝向与"车->前视点"方向的夹角，Ld = 前视距离
+        //
+        // **关键差别**：这里用 Vehicle.SteeringScale（真实转向输入）+ ForwardSpeed，
+        // 而不是像旧版那样直接改 Heading。直接改 Heading 会绕过物理与碰撞约束 ——
+        // 那正是"装甲车叠罗汉"的成因。用转向角则由物理引擎负责，车会正常转弯。
+        //
+        // 与战斗逻辑的互斥（用户明确要求）：
+        //   * 本方法**不下发任何 TASK_***。它和引擎的驾驶任务天然互斥 ——
+        //     进入 Pure Pursuit 前会先 clear 掉 ped 的脚本任务。
+        //   * 战斗是**独立叠加层**，不改变驾驶模式：
+        //       - 车载武器 SET_VEHICLE_SHOOT_AT_TARGET 只转炮塔，不是任务
+        //       - 乘客 TASK_DRIVE_BY 只作用于乘客（乘客没有驾驶控制）
+        //     所以"边跟随边开火"不会互相拆台。
         // ==================================================================
+
+        /// <summary>
+        /// 用 Pure Pursuit 沿路网追踪玩家。
+        ///
+        /// 返回 true 表示本 tick 已接管驾驶（调用方不应再下发驾驶任务）。
+        /// </summary>
+        private bool PurePursuitToward(Ped player, float distance)
+        {
+            try
+            {
+                Vehicle car = _escortVehicle;
+                if (car == null || !car.Exists()) return false;
+                if (car.IsAircraft) return false;      // 飞行器不走地面驾驶
+
+                Vector3 pos = car.Position;
+                float speed = car.Speed;
+
+                // ---- 1. 前视距离：随速度增大（Pure Pursuit 的核心参数）----
+                float lookAhead = BuddyConfig.PurePursuitLookAheadBase +
+                                  BuddyConfig.PurePursuitLookAheadPerSpeed * speed;
+                if (lookAhead < BuddyConfig.PurePursuitLookAheadMin)
+                    lookAhead = BuddyConfig.PurePursuitLookAheadMin;
+                if (lookAhead > BuddyConfig.PurePursuitLookAheadMax)
+                    lookAhead = BuddyConfig.PurePursuitLookAheadMax;
+
+                // ---- 2. 取前视点：**落在路网上**的、朝玩家方向的那个点 ----
+                //
+                // 这一步等价于 CCarAI 的 JoinCarWithRoadSystem —— 把目标映射到路网。
+                // 直接朝玩家坐标开会穿野地撞墙；取路网节点才会沿公路走。
+                Vector3 look = FindLookAheadOnRoad(pos, player.Position, lookAhead);
+
+                // ---- 3. Pure Pursuit 转向律 ----
+                //   alpha = 车头朝向 与 车->前视点方向 的夹角
+                float desiredHeading = HeadingTo(pos, look);
+                float alpha = NormalizeAngle(desiredHeading - car.Heading);   // [-180,180]
+
+                double alphaRad = alpha * Math.PI / 180.0;
+
+                //   曲率 k = 2 sin(alpha) / Ld
+                float curvature = (float)(2.0 * Math.Sin(alphaRad) / lookAhead);
+
+                //   前轮转角 = atan(轴距 * k)，再归一化到 SteeringScale 的 [-1,1]
+                float steerAngle = (float)Math.Atan(BuddyConfig.PurePursuitWheelBase * curvature);
+                float steerNorm = steerAngle / BuddyConfig.PurePursuitMaxSteerAngle;
+                if (steerNorm > 1.0f) steerNorm = 1.0f;
+                if (steerNorm < -1.0f) steerNorm = -1.0f;
+
+                // ---- 4. 障碍优先：前方有车/人就刹车（比驱动优先）----
+                float probe = 5.0f + speed * 0.45f;
+                if (IsBlockedAhead(car, probe))
+                {
+                    Function.Call(Hash.SET_VEHICLE_FORWARD_SPEED, car, 0.0f);
+                    car.SteeringScale = 0.0f;
+                    return true;
+                }
+
+                // ---- 5. 速度控制 ----
+                float v;
+                if (distance <= BuddyConfig.PurePursuitStopRange)
+                {
+                    v = 0.0f;                               // 已到位，停住
+                }
+                else if (distance > 90.0f) v = 32.0f;
+                else if (distance > 40.0f) v = 24.0f;
+                else if (distance > 22.0f) v = 16.0f;
+                else v = 10.0f;
+
+                // 转向角大 = 正在急弯，减速（Pure Pursuit 的常规做法）
+                if (Math.Abs(alpha) > 35.0f) v *= 0.45f;
+                else if (Math.Abs(alpha) > 18.0f) v *= 0.75f;
+
+                car.SteeringScale = steerNorm;
+                Function.Call(Hash.SET_VEHICLE_FORWARD_SPEED, car, v);
+
+                if (Game.GameTime >= _nextEscortDiag)
+                {
+                    _nextEscortDiag = Game.GameTime + 2500;
+                    BuddyLog.Info("escort[" + _squadIndex + "]: PURE PURSUIT  dist=" +
+                                  distance.ToString("0.0") + " Ld=" + lookAhead.ToString("0.0") +
+                                  " alpha=" + alpha.ToString("0") +
+                                  " steer=" + steerNorm.ToString("0.00") +
+                                  " v=" + v.ToString("0.0") +
+                                  " vehSpeed=" + speed.ToString("0.0"));
+                }
+
+                return true;
+            }
+            catch (Exception ex)
+            {
+                BuddyLog.Error("PurePursuitToward failed", ex);
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// 进入 Pure Pursuit 驾驶模式。
+        ///
+        /// **互斥处理**（用户明确要求"不和射击/驾驶逻辑互斥"）：
+        ///
+        ///   两种驾驶方式任一时刻**只能有一个生效**：
+        ///     A. 引擎的驾驶任务（TASK_VEHICLE_ESCORT / MISSION_PED_TARGET）
+        ///     B. Pure Pursuit 直接控制（SteeringScale + SET_VEHICLE_FORWARD_SPEED）
+        ///
+        ///   所以进入 B 之前先 **CLEAR_PED_TASKS** 清掉 A，否则两套会互相抢控制权 ——
+        ///   这正是之前"车抽搐/乱撞"的来源之一。
+        ///
+        ///   而**射击**是独立叠加层，不占驾驶控制：
+        ///     * 车载武器用 SET_VEHICLE_SHOOT_AT_TARGET（只转炮塔，不是任务）
+        ///     * 乘客用 TASK_DRIVE_BY（乘客没有驾驶控制）
+        ///   所以 Pure Pursuit 期间照样能开火。
+        /// </summary>
+        private void EnterPurePursuit()
+        {
+            try
+            {
+                if (_purePursuit) return;
+                if (_escortVehicle == null || !_escortVehicle.Exists()) return;
+                if (_escortVehicle.IsAircraft) return;
+
+                // 清掉引擎的驾驶任务，避免两套驾驶方式同时生效
+                try { Function.Call(Hash.CLEAR_PED_TASKS, _ped); } catch (Exception) { }
+                try { Function.Call(Hash.CLEAR_PED_SECONDARY_TASK, _ped); } catch (Exception) { }
+
+                _purePursuit = true;
+                _currentMission = -1;      // 退出该模式后要重新下发引擎任务
+
+                BuddyLog.Info("escort[" + _squadIndex + "]: engine driving stalled 8s -> " +
+                              "PURE PURSUIT (model=" + _escortVehicle.Model.Hash +
+                              ", class=" + _escortVehicle.ClassType + ")");
+                Notify("~b~队友 " + (_squadIndex + 1) + " 号改用 Pure Pursuit 驾驶");
+            }
+            catch (Exception ex) { BuddyLog.Error("EnterPurePursuit failed", ex); }
+        }
+
+        /// <summary>离开 Pure Pursuit，交回引擎驾驶。会先把直接控制归零。</summary>
+        private void ExitPurePursuit()
+        {
+            try
+            {
+                if (!_purePursuit) return;
+                _purePursuit = false;
+                _escortLongRange = false;
+                _escortClearedOnce = false;
+                _currentMission = -1;
+                _escortStallSince = 0;
+
+                if (_escortVehicle != null && _escortVehicle.Exists())
+                {
+                    Function.Call(Hash.SET_VEHICLE_FORWARD_SPEED, _escortVehicle, 0.0f);
+                    _escortVehicle.SteeringScale = 0.0f;
+                }
+
+                BuddyLog.Info("escort[" + _squadIndex + "]: left PURE PURSUIT, back to engine driving");
+            }
+            catch (Exception) { }
+        }
+
+        /// <summary>
+        /// 取前视点：在车前方 <paramref name="lookAhead"/> 米、朝目标方向的位置，
+        /// **吸附到道路节点**。等价于 CCarAI 的 JoinCarWithRoadSystem。
+        ///
+        /// 用 GET_NTH_CLOSEST_VEHICLE_NODE_FAVOUR_DIRECTION：它在指定位置附近
+        /// 按"偏向某个方向"来挑路网节点，正好用于沿路追踪移动目标。
+        /// </summary>
+        private static Vector3 FindLookAheadOnRoad(Vector3 carPos, Vector3 targetPos, float lookAhead)
+        {
+            // 先算一个朝目标的粗略前视点
+            Vector3 dir = targetPos - carPos;
+            float len = dir.Length();
+            if (len < 0.5f) return targetPos;
+            dir = dir * (1.0f / len);
+
+            Vector3 rough = carPos + dir * lookAhead;
+
+            // 偏好方向：从当前位置指向目标
+            Vector3 want = targetPos;
+
+            try
+            {
+                var outPos = new OutputArgument();
+                var outHeading = new OutputArgument();
+
+                bool ok = Function.Call<bool>(Hash.GET_NTH_CLOSEST_VEHICLE_NODE_FAVOUR_DIRECTION,
+                                              carPos.X, carPos.Y, carPos.Z,
+                                              want.X, want.Y, want.Z,
+                                              1,             // nthClosest = 1，也就是最近的
+                                              outPos, outHeading,
+                                              1, 3.0f, 0f);
+
+                if (ok)
+                {
+                    Vector3 node = outPos.GetResult<Vector3>();
+                    // 节点不能在车后面（否则会掉头），也不能吸到高架/地下
+                    Vector3 toNode = node - carPos;
+                    if (toNode.Length() > 1.0f)
+                    {
+                        float dot = toNode.X * dir.X + toNode.Y * dir.Y;
+                        if (dot > 0.0f && Math.Abs(node.Z - carPos.Z) < 20.0f)
+                            return node;
+                    }
+                }
+            }
+            catch (Exception) { }
+
+            // 取不到路网节点就退回粗略前视点（至少还能朝目标开）
+            return rough;
+        }
 
         private void DirectDriveToward(Ped player, float distance)
         {
@@ -1881,19 +2121,32 @@ namespace GTA5Buddy
 
                 if (hasVehicleWeapon)
                 {
-                    // 坦克炮塔 / APC 车载武器：直接瞄准目标开火
+                    // 坦克炮塔 / APC 车载武器：直接瞄准目标开火。
+                    // **这个原生不占脚本任务槽**，所以和 Pure Pursuit 的直接控制不冲突。
                     Function.Call(Hash.SET_VEHICLE_SHOOT_AT_TARGET, _ped, enemy, 0f, 0f, 0f);
                 }
 
-                // 这一条对两种载具都适用：让驾驶员用车上的武器打目标
-                // p2 是射击精度相关的参数，给 1.0 表示尽量瞄准
-                Function.Call(Hash.TASK_VEHICLE_SHOOT_AT_PED, _ped, enemy, 1.0f);
+                // ---- 与驾驶模式的互斥处理（用户明确要求）--------------------
+                //
+                // Pure Pursuit 期间**不能**下发 TASK_VEHICLE_SHOOT_AT_PED：
+                // 那是脚本任务，会盖掉/干扰我们的直接控制（SteeringScale +
+                // SET_VEHICLE_FORWARD_SPEED），表现为车抽搐或乱撞。
+                //
+                // 这时改由**战斗属性**让引擎的战斗 AI 自行开枪
+                // （见 PrepareVehicleCombat 里的 AlwaysFight / CanUseVehicles），
+                // 炮塔瞄准仍然每帧设置，所以火力不受影响。
+                if (!_purePursuit)
+                {
+                    // p2 是射击精度参数，给 1.0 表示尽量瞄准
+                    Function.Call(Hash.TASK_VEHICLE_SHOOT_AT_PED, _ped, enemy, 1.0f);
+                }
 
                 if (!_escortEngaging)
                 {
                     _escortEngaging = true;
                     BuddyLog.Info("escort[" + _squadIndex + "]: engaging from vehicle, " +
                                   "vehicleWeapon=" + hasVehicleWeapon +
+                                  " driveMode=" + (_purePursuit ? "PurePursuit" : "EngineTask") +
                                   " target=" + enemy.Handle);
                 }
             }

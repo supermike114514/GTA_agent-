@@ -46,6 +46,42 @@ namespace GTA5Buddy
         internal const int EscortCloseTeleportStalledMs = 6000;
         internal const int EscortCloseTeleportCooldownMs = 15000;
 
+        // ==================================================================
+        // Pure Pursuit 驾驶（参考 GTA 内部 CCarAI / CAutoPilot 的做法）
+        // ==================================================================
+        //
+        // GTA 内部的 CCarAI + CAutoPilot 是这样开车的：
+        //   1. JoinCarWithRoadSystem 把目标位置映射到路网
+        //   2. 用 A* / Dijkstra 在路网上算出一条路径
+        //   3. 用 **Pure Pursuit** 沿路径行驶 —— 在车前方取一个"前视点"，
+        //      算出追踪它所需的转向角，从而平滑地贴着路网开
+        //
+        // Pure Pursuit 的转向律（经典形式）：
+        //
+        //     曲率  k     = 2 * sin(alpha) / Ld
+        //     前轮角 steer = atan(轴距 * k)
+        //
+        //   alpha = 车头朝向 与 车->前视点方向 的夹角
+        //   Ld    = 前视距离（**随车速增大**，这是"不画龙"的关键）
+        //
+        // Ld 随速度变化这点特别重要：固定的前视距离在低速时会左右摆、
+        // 高速时会切弯内。这也正是脚本层手写"直接朝目标转"最常犯的错。
+
+        /// <summary>前视距离 = 基准 + 速度系数 * 当前速度（米）。</summary>
+        internal const float PurePursuitLookAheadBase = 6.0f;
+        internal const float PurePursuitLookAheadPerSpeed = 1.1f;
+        internal const float PurePursuitLookAheadMin = 8.0f;
+        internal const float PurePursuitLookAheadMax = 40.0f;
+
+        /// <summary>车辆轴距（米）。Pure Pursuit 对轴距不敏感，取常见轿车值即可。</summary>
+        internal const float PurePursuitWheelBase = 2.8f;
+
+        /// <summary>最大前轮转角（弧度），用于把转向角归一化成 SteeringScale。</summary>
+        internal const float PurePursuitMaxSteerAngle = 0.6f;
+
+        /// <summary>距离玩家多少米以内就停车（米）。</summary>
+        internal const float PurePursuitStopRange = 14.0f;
+
         /// <summary>
         /// 小队成员之间的分离距离（米），交给引擎的编队算法使用。
         ///
