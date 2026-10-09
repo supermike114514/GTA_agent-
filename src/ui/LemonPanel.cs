@@ -73,6 +73,7 @@ namespace GTA5Buddy
 
         /// <summary>特色开关：变形金刚模式（车辆会叠罗汉）。见 Companion.TransformerMode。</summary>
         private NativeCheckboxItem _transformerItem;
+        private NativeCheckboxItem _purePursuitItem;   // Pure Pursuit 总开关（默认关）
 
         /// <summary>
         /// Model the companion starts with, and what "恢复默认外观" switches back to.
@@ -770,6 +771,24 @@ namespace GTA5Buddy
                     : "~b~变形金刚模式：关闭（正常沿路跟随）");
             };
             _vehicles.Add(_transformerItem);
+
+            // ---- Pure Pursuit 开关 ------------------------------------------
+            //
+            // 默认**关闭**：实测它接管后车辆会"飞起来 / 到处走"
+            // （根因是 SET_VEHICLE_FORWARD_SPEED 硬设速度，已改用物理油门/刹车）。
+            // 在你确认行为正常之前，默认不启用它。
+            _purePursuitItem = new NativeCheckboxItem(
+                "进阶 · Pure Pursuit 驾驶",
+                "引擎驾驶连续失效 10 秒后用前视点算法接管（默认关闭）",
+                Companion.PurePursuitEnabled);
+            _purePursuitItem.CheckboxChanged += delegate
+            {
+                Companion.PurePursuitEnabled = _purePursuitItem.Checked;
+                Notify(Companion.PurePursuitEnabled
+                    ? "~b~Pure Pursuit：开启（引擎驾驶失效时接管）"
+                    : "~b~Pure Pursuit：关闭");
+            };
+            _vehicles.Add(_purePursuitItem);
 
             int shown = 0;
             foreach (VehiclePanel.Entry e in _vehicleData.VisibleEntries())

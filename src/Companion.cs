@@ -889,6 +889,16 @@ namespace GTA5Buddy
         /// </summary>
         internal static bool TransformerMode { get; set; }
 
+        /// <summary>
+        /// Pure Pursuit 总开关。**默认关闭。**
+        ///
+        /// 为什么默认关：实测它接管后车辆会"飞起来 / 到处走" ——
+        /// 根因是 SET_VEHICLE_FORWARD_SPEED（硬设速度、绕过牵引力与重力），
+        /// 已改用物理油门/刹车。但在你确认行为正常之前，默认不启用它，
+        /// 免得继续影响你的游戏。面板上可以打开来试。
+        /// </summary>
+        internal static bool PurePursuitEnabled { get; set; }
+
         // 车载开火的节流与状态
         private int _nextEscortCombat;
         private bool _escortEngaging;
@@ -1244,7 +1254,42 @@ namespace GTA5Buddy
                     }
 
                     // 阶梯 2：长时间卡住 -> 切 Pure Pursuit
-                    if (!_purePursuit && stalledMs > 8000)
+                    //
+                    // **切换条件被收紧了很多**，因为之前那个条件太宽松：
+                    //   speed < 1 且 distance > 15，持续 8 秒
+                    // 在路口等灯、堵车、被撞停都会满足，于是频繁误触发 ——
+                    // 实测 ANTI-STALL 触发 370 次、Pure Pursuit 进入 35 次，
+                    // 而且它接管后车辆会飞起来 / 乱走。
+                    //
+                    // 收紧后的条件（全部满足才接管）：
+                    //   1. 总开关打开（面板可关，默认**关闭**）
+                    //   2. 车速 < 1 且距玩家 > 25 米，持续 10 秒
+                    //   3. **玩家自己在移动** —— 否则双方都在等灯也会误触发
+                    //   4. 车辆四轮着地、没翻车、没腾空 —— 这种状态不该接管
+                    bool playerMoving = true;
+                    try
+                    {
+                        playerMoving = player.IsInVehicle()
+                            ? (player.CurrentVehicle.Speed > 3.0f)
+                            : true;
+                    }
+                    catch (Exception) { }
+
+                    bool carHealthy = false;
+                    try
+                    {
+                        carHealthy = !_escortVehicle.IsInAir &&
+                                     _escortVehicle.IsOnAllWheels &&
+                                     !_escortVehicle.IsUpsideDown;
+                    }
+                    catch (Exception) { }
+
+                    if (!_purePursuit &&
+                        PurePursuitEnabled &&
+                        stalledMs > 10000 &&
+                        distance > 25.0f &&
+                        playerMoving &&
+                        carHealthy)
                     {
                         EnterPurePursuit();
                     }
@@ -1506,32 +1551,73 @@ namespace GTA5Buddy
                 if (steerNorm > 1.0f) steerNorm = 1.0f;
                 if (steerNorm < -1.0f) steerNorm = -1.0f;
 
-                // ---- 4. 障碍优先：前方有车/人就刹车（比驱动优先）----
+                // ---- 4. 空中/翻覆保护 ------------------------------------------
+                //
+                // 车辆腾空或四轮没着地时**绝不施加任何控制** —— 否则会和物理引擎
+                // 打架，把车弹得更高更乱（用户反馈的"车辆飞起来"）。
+                // 这时候松开油门、回正方向，让物理自己把车落稳。
+                try
+                {
+                    if (car.IsInAir || !car.IsOnAllWheels || car.IsUpsideDown)
+                    {
+                        car.Throttle = 0.0f;
+                        car.BrakePower = 0.0f;
+                        car.SteeringScale = 0.0f;
+                        return true;
+                    }
+                }
+                catch (Exception) { }
+
+                // ---- 5. 障碍优先：前方有车/人就刹车（比驱动优先）----
                 float probe = 5.0f + speed * 0.45f;
                 if (IsBlockedAhead(car, probe))
                 {
-                    Function.Call(Hash.SET_VEHICLE_FORWARD_SPEED, car, 0.0f);
+                    car.Throttle = 0.0f;
+                    car.BrakePower = 1.0f;
                     car.SteeringScale = 0.0f;
                     return true;
                 }
 
-                // ---- 5. 速度控制 ----
-                float v;
-                if (distance <= BuddyConfig.PurePursuitStopRange)
-                {
-                    v = 0.0f;                               // 已到位，停住
-                }
-                else if (distance > 90.0f) v = 32.0f;
-                else if (distance > 40.0f) v = 24.0f;
-                else if (distance > 22.0f) v = 16.0f;
-                else v = 10.0f;
+                // ---- 6. 速度控制（按距离分级，转向角大时减速）----
+                float want;
+                if (distance <= BuddyConfig.PurePursuitStopRange) want = 0.0f;
+                else if (distance > 90.0f) want = 24.0f;
+                else if (distance > 40.0f) want = 18.0f;
+                else if (distance > 22.0f) want = 13.0f;
+                else want = 8.0f;
 
-                // 转向角大 = 正在急弯，减速（Pure Pursuit 的常规做法）
-                if (Math.Abs(alpha) > 35.0f) v *= 0.45f;
-                else if (Math.Abs(alpha) > 18.0f) v *= 0.75f;
+                if (Math.Abs(alpha) > 35.0f) want *= 0.45f;
+                else if (Math.Abs(alpha) > 18.0f) want *= 0.75f;
+
+                // ---- 7. 输出：**物理油门/刹车**，不是硬设速度 --------------------
+                //
+                // **重要修正，直接对应用户反馈的"车辆总是飞起来或者到处走"。**
+                //
+                // 上一版用 SET_VEHICLE_FORWARD_SPEED —— 那是**硬设速度**，
+                // 绕过轮胎抓地和重力约束。一撞到东西，物理引擎就会把车弹飞，
+                // 或者沿速度方向硬推出去，表现就是"飞起来 / 乱走"。
+                //
+                // 改用 Vehicle.Throttle / BrakePower 的物理输入：由引擎的车辆物理
+                // 决定实际运动 —— 撞墙就是撞墙，不会飞。
+                float err = want - speed;
+
+                if (Math.Abs(err) < 0.6f)
+                {
+                    car.Throttle = 0.0f;
+                    car.BrakePower = want <= 0.1f ? 0.6f : 0.0f;
+                }
+                else if (err > 0.0f)
+                {
+                    car.Throttle = Math.Min(err / 8.0f, 1.0f);
+                    car.BrakePower = 0.0f;
+                }
+                else
+                {
+                    car.Throttle = 0.0f;
+                    car.BrakePower = Math.Min(-err / 8.0f, 1.0f);
+                }
 
                 car.SteeringScale = steerNorm;
-                Function.Call(Hash.SET_VEHICLE_FORWARD_SPEED, car, v);
 
                 if (Game.GameTime >= _nextEscortDiag)
                 {
@@ -1540,8 +1626,11 @@ namespace GTA5Buddy
                                   distance.ToString("0.0") + " Ld=" + lookAhead.ToString("0.0") +
                                   " alpha=" + alpha.ToString("0") +
                                   " steer=" + steerNorm.ToString("0.00") +
-                                  " v=" + v.ToString("0.0") +
-                                  " vehSpeed=" + speed.ToString("0.0"));
+                                  " want=" + want.ToString("0.0") +
+                                  " throttle=" + car.Throttle.ToString("0.00") +
+                                  " brake=" + car.BrakePower.ToString("0.00") +
+                                  " vehSpeed=" + speed.ToString("0.0") +
+                                  " onWheels=" + car.IsOnAllWheels);
                 }
 
                 return true;
