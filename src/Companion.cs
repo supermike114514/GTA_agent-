@@ -876,6 +876,7 @@ namespace GTA5Buddy
         // 驾驶模式：true = Pure Pursuit 直接控制（引擎驾驶失效时的替代）
         // 两种驾驶方式互斥：_purePursuit 为 true 时绝不下发 TASK_VEHICLE_*
         private bool _purePursuit;
+        private int _purePursuitSince;   // 进入 Pure Pursuit 的时刻（防抖）
         private int _nextAntiStall;   // 防卡死倒车节流
         private int _nextRelationSync;   // 关系表同步节流
 
@@ -1267,10 +1268,22 @@ namespace GTA5Buddy
                 // 战斗是独立叠加层（炮塔瞄准不是任务），因此"边跟随边开火"不互斥。
                 if (_purePursuit)
                 {
-                    // 已经跟到位而且玩家没动 —— 让它回到引擎驾驶，省下每帧的直接控制
-                    if (distance < 25.0f && _escortVehicle.Speed < 2.0f)
+                    // ---- 退出判定 ------------------------------------------
+                    //
+                    // **这里曾经有一个致命 bug**：退出条件是
+                    //     distance < 25 && Speed < 2
+                    // 而"速度 < 2"**恰好就是进入本模式的原因**（车卡住 = 速度 0）。
+                    // 于是同一 tick 内"进入 -> 立即退出"，反复横跳：
+                    //     实测日志：进入 35 次、退出 34 次、**驾驶循环 0 次**。
+                    //
+                    // 正确做法：只有在**真正跟到位**（distance <= StopRange）
+                    // 且已经在本模式里待够一段时间（防止抖动）之后才交回引擎。
+                    // 本模式自己能处理"到位停车"（v = 0），所以不急着退。
+                    int dwell = Game.GameTime - _purePursuitSince;
+                    if (distance <= BuddyConfig.PurePursuitStopRange && dwell > 3000)
                     {
                         ExitPurePursuit();
+                        // 不 return：本 tick 继续往下走引擎驾驶路径
                     }
                     else
                     {
@@ -1338,7 +1351,10 @@ namespace GTA5Buddy
                 //
                 // 用户建议的处理方式。倒车能有效脱离"顶住墙角/卡在障碍上"的状态，
                 // 之后重新下发跟随任务即可恢复。
-                if (stalled)
+                //
+                // **Pure Pursuit 期间跳过**：那时车由我们直接控制，
+                // 再插一个倒车任务会和直接控制抢控制权（互斥原则）。
+                if (stalled && !_purePursuit)
                 {
                     int stalledMs = Game.GameTime - _escortStallSince;
 
@@ -1567,6 +1583,7 @@ namespace GTA5Buddy
                 try { Function.Call(Hash.CLEAR_PED_SECONDARY_TASK, _ped); } catch (Exception) { }
 
                 _purePursuit = true;
+                _purePursuitSince = Game.GameTime;
                 _currentMission = -1;      // 退出该模式后要重新下发引擎任务
 
                 BuddyLog.Info("escort[" + _squadIndex + "]: engine driving stalled 8s -> " +
