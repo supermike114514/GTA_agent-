@@ -1,7 +1,7 @@
 # GTA5Buddy — GTA V 故事模式 AI 队友
 
 一个 ScriptHookVDotNet 脚本：把一具有独立状态机的 AI 队友塞进 GTA V 线下，全程陪伴，
-不误伤你、会自己战斗、会开车接你、倒地能救。
+
 
 - 目标版本：**GTA V Enhanced 1.0.1158.16**（`E:\SteamLibrary\steamapps\common\Grand Theft Auto V Enhanced`）
 - 运行时：ScriptHookV **3889.0 / 1158.13** + ScriptHookVDotNet Enhanced **v1.1.0.6**
@@ -163,7 +163,7 @@ GTA5Buddy 控制台
 > 换成 LemonUI 之后这个问题不复存在。
 
 > 配置文件解析逻辑我用反射独立测过：`true/false/1/0/yes/no` 都能正确识别，非法值
-> （如 `abc`、乱码）会**优雅回退到默认值**而不是崩溃。
+> （如 `abc`、乱码）会**回退到默认值**而不是崩溃。
 
 ---
 
